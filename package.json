@@ -1,0 +1,13 @@
+{
+  "name": "ta-love-app-grab",
+  "version": "0.2.0",
+  "description": "她不一样 · 关系分析室（全自动抓取桌面版）",
+  "main": "electron-main.js",
+  "scripts": {
+    "start": "electron --no-sandbox --disable-gpu --in-process-gpu ."
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^31.7.7"
+  }
+}
