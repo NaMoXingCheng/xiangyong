@@ -1,0 +1,12 @@
+# 依赖与运行时
+node_modules/
+
+# 本地数据与日志
+data/
+temp/
+*.log
+
+# 截图与杂项
+screenshots/
+.DS_Store
+Thumbs.db
