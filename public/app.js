@@ -856,6 +856,7 @@
     buildGrass();
   }
   // 长草彩蛋：仅在绿色主题下、且开关打开时显示
+  // 用像素坐标画细草叶（避免 preserveAspectRatio 横向拉伸把草叶拉成宽扁带子）
   function buildGrass() {
     const field = $('#grassField');
     if (!field) return;
@@ -865,24 +866,55 @@
     const show = on && isGreen;
     document.body.classList.toggle('grass-on', show);
     if (!show) { field.innerHTML = ''; return; }
-    const n = 44;
-    let tufts = '';
-    for (let i = 0; i < n; i++) {
-      const x = (i / (n - 1)) * 100;
-      const h1 = 18 + ((i * 11) % 15);
-      const h2 = 13 + ((i * 7) % 9);
-      const lean = ((i * 17) % 9) - 4;
-      const g = 115 + ((i * 29) % 65);
-      const c = `hsl(${g},62%,55%)`;
-      const c2 = `hsl(${g},72%,70%)`;
-      tufts += `<g class="tuft" transform="translate(${x},0)" style="animation-delay:${(i % 7) * 0.22}s">
-        <path d="M0 42 Q${lean} ${42 - h2} ${lean + 4} ${42 - h1}" stroke="${c}" stroke-width="2.6" fill="none" stroke-linecap="round"/>
-        <path d="M5 42 Q${lean + 5} ${42 - h2 - 3} ${lean + 9} ${42 - h1 - 6}" stroke="${c2}" stroke-width="2.2" fill="none" stroke-linecap="round"/>
-        <path d="M10 42 Q${lean + 10} ${42 - h2 + 2} ${lean + 15} ${42 - h1 + 3}" stroke="${c}" stroke-width="2.6" fill="none" stroke-linecap="round"/>
-      </g>`;
+
+    const W = Math.max(320, document.documentElement.clientWidth || 1200);
+    const H = 46;
+    // 确定性伪随机（同一种子结果稳定，避免每次渲染抖动）
+    const rnd = s => { const x = Math.sin(s * 127.1 + 311.7) * 43758.5453; return x - Math.floor(x); };
+
+    // 一片叶：从 (x,H) 起、向上弯曲到 (x+lean*1.4, H-h)，细 1.4~1.7px
+    const blade = (x, h, lean, hue, light, w, fd) =>
+      `<path class="blade" style="--fd:${(rnd(fd) * 1.5).toFixed(2)}s" d="M${x.toFixed(1)} ${H} q ${lean.toFixed(1)} ${(-h * 0.55).toFixed(1)} ${(lean * 1.4).toFixed(1)} ${(-h).toFixed(1)}" stroke="hsl(${hue}, ${60 + rnd(fd) * 12}%, ${light}%)" stroke-width="${w}" fill="none" stroke-linecap="round"/>`;
+
+    // 一层草：n 丛、每丛 3 片叶（独立弯曲/颜色/相位）；后排暗矮，前排亮高
+    const layer = (n, hMin, hMax, hue, light, w) => {
+      let out = '';
+      const step = W / n;
+      for (let i = 0; i < n; i++) {
+        const x = i * step + step * 0.5 + (rnd(i * 13 + 1) - 0.5) * step * 0.75;
+        const h = hMin + rnd(i * 3 + 1) * (hMax - hMin);
+        const lean = (rnd(i * 7 + 2) - 0.5) * 11;
+        const ph = (rnd(i * 23 + 7) * 2.6).toFixed(2);
+        const gd = (rnd(i * 31 + 5) * 0.85).toFixed(2);
+        out += `<g class="tuft" style="--sway:${(3.6 + rnd(i * 41) * 3).toFixed(2)}s;--ph:${ph}s;--gd:${gd}s">
+          ${blade(x - 2.5, h, lean, hue, light, w, i * 53)}
+          ${blade(x, h * 0.82, lean + 3, hue, light + 9, w * 0.9, i * 61 + 3)}
+          ${blade(x + 2.5, h * 0.62, lean - 3, hue, light - 7, w, i * 71 + 6)}
+        </g>`;
+      }
+      return `<g class="row">${out}</g>`;
+    };
+
+    // 萤火虫：尾灯 + 呼吸光晕 + 拖尾（HTML 元素定位，避免 SVG 拉伸）
+    let fireflies = '';
+    for (let i = 0; i < 7; i++) {
+      const fx = (3 + rnd(i * 53 + 11) * 94).toFixed(1);
+      const fd = (5 + rnd(i * 67) * 6).toFixed(2);
+      const fdl = (rnd(i * 83) * 5).toFixed(2);
+      fireflies += `<span class="firefly" style="left:${fx}%;--fd:${fd}s;--fdl:${fdl}s"><i class="ff-glow"></i><i class="ff-core"></i><i class="ff-tail"></i></span>`;
     }
-    field.innerHTML = `<svg viewBox="0 0 100 42" preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg">${tufts}</svg>`;
+
+    field.innerHTML = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg">
+      ${layer(32, 15, 25, 118, 44, 1.6)}
+      ${layer(21, 22, 34, 127, 58, 1.5)}
+    </svg>${fireflies}`;
   }
+  // 窗口尺寸变化时重画（防抖），避免草被拉伸错位
+  let _grassRsz = null;
+  window.addEventListener('resize', () => {
+    clearTimeout(_grassRsz);
+    _grassRsz = setTimeout(buildGrass, 160);
+  });
   function bindSettings() {
     const btn = $('#settingsBtn');
     if (!btn) return;

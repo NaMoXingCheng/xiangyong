@@ -332,17 +332,20 @@ html,body{height:100%;overflow:hidden}
 .side-note{flex:none;margin-top:10px}
 .main{display:flex;flex-direction:column;gap:18px;min-height:0;overflow-y:auto;padding-right:4px;scroll-behavior:smooth}
 
-/* 保留视觉增强：卡片高光 / 标题竖线 / 联系人激活态 */
+/* 保留视觉增强：卡片高光 / 标题竖线 / 联系人激活态（液态玻璃质感） */
 .card{
   position:relative;
-  background:linear-gradient(165deg, rgba(31,68,112,.92), rgba(23,52,83,.94));
-  border:1px solid rgba(88,138,186,.5);
-  box-shadow:0 0 0 1px rgba(0,0,0,.28), 0 10px 30px -14px rgba(0,0,0,.65), inset 0 1px 0 rgba(244,227,178,.07);
-  transition:border-color .25s, box-shadow .25s, transform .25s;
+  background:linear-gradient(160deg, rgba(255,255,255,.09), rgba(255,255,255,.02) 52%, rgba(255,255,255,.05));
+  backdrop-filter:blur(22px) saturate(160%);
+  -webkit-backdrop-filter:blur(22px) saturate(160%);
+  border:1px solid rgba(255,255,255,.13);
+  border-radius:14px;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.14), inset 0 -1px 0 rgba(255,255,255,.03), 0 0 0 1px rgba(0,0,0,.18), 0 12px 32px -14px rgba(0,0,0,.6);
+  transition:border-color .25s, box-shadow .25s, transform .25s, background .25s;
 }
-.card::after{content:"";position:absolute;inset:0;pointer-events:none;border-radius:4px;
-  background:linear-gradient(180deg, rgba(244,227,178,.05), transparent 18%)}
-.card:hover{border-color:rgba(var(--accent-rgb),.55);box-shadow:0 0 0 1px rgba(0,0,0,.28), 0 14px 36px -14px rgba(0,0,0,.7), 0 0 18px rgba(var(--accent-rgb),.10)}
+.card::after{content:"";position:absolute;inset:0;pointer-events:none;border-radius:14px;
+  background:linear-gradient(180deg, rgba(255,255,255,.07), transparent 22%)}
+.card:hover{border-color:rgba(var(--accent-rgb),.5);box-shadow:inset 0 1px 0 rgba(255,255,255,.14), 0 0 0 1px rgba(0,0,0,.2), 0 16px 40px -14px rgba(0,0,0,.7), 0 0 22px rgba(var(--accent-rgb),.12)}
 .sec-t{display:flex;align-items:center;gap:10px;position:relative;padding-left:12px}
 .sec-t::before{content:"";position:absolute;left:0;top:50%;transform:translateY(-50%);width:3px;height:14px;background:var(--gold);box-shadow:0 0 8px rgba(var(--gold-rgb),.7)}
 .person{background:linear-gradient(90deg, rgba(13,32,52,.65), rgba(13,32,52,.28));border:1px solid transparent}
@@ -513,15 +516,44 @@ html,body{height:100%;overflow:hidden}
 .ap-repair:hover{background:rgba(126,224,163,.22)}
 .ap-repair:disabled{opacity:.6;cursor:default}
 
-/* ================= 绿色彩蛋：页面边框长草 ================= */
-.grass{position:fixed;left:0;right:0;bottom:0;height:42px;z-index:95;pointer-events:none;display:none;opacity:.55}
+/* ================= 绿色彩蛋：页面底部长草（双层景深 + 生长 + 逐叶摆动 + 萤火） ================= */
+.grass{position:fixed;left:0;right:0;bottom:0;height:46px;z-index:95;pointer-events:none;display:none;opacity:.85}
 body.grass-on .grass{display:block}
 .grass svg{width:100%;height:100%;display:block}
-.grass .tuft{transform-origin:50% 100%;animation:grasssway 2.8s ease-in-out infinite}
-.grass .tuft:nth-child(2n){animation-duration:3.4s;animation-delay:.3s}
-.grass .tuft:nth-child(3n){animation-duration:3.1s;animation-delay:.15s}
-.grass .tuft:nth-child(5n){animation-duration:3.9s;animation-delay:.5s}
-@keyframes grasssway{0%,100%{transform:rotate(0deg)}50%{transform:rotate(4deg)}}
+/* 外层 .pos 只负责定位（SVG transform 属性，永不被 CSS 动效覆盖） */
+.grass .tuft{transform-box:fill-box;transform-origin:50% 100%;
+  animation:grass-sway var(--sway,5s) cubic-bezier(.45,0,.35,1) var(--ph,0s) infinite,
+            grass-grow 1.15s cubic-bezier(.16,1,.3,1) var(--gd,0s) both}
+.grass .blade{transform-box:fill-box;transform-origin:50% 100%;
+  animation:blade-flutter 2.7s ease-in-out var(--fd,0s) infinite}
+/* 后排更淡更虚，制造景深 */
+.grass .row:nth-child(1) .tuft{opacity:.6;filter:saturate(.82)}
+/* 生长：从地面冒出（scale 用独立属性，与 rotate 并行不冲突） */
+@keyframes grass-grow{from{scale:1 0}to{scale:1 1}}
+/* 摆动：非对称多段，模拟阵风掠过 */
+@keyframes grass-sway{0%,100%{rotate:0deg}30%{rotate:3deg}55%{rotate:-2.2deg}78%{rotate:1.4deg}}
+/* 单叶微颤：每片独立相位 */
+@keyframes blade-flutter{0%,100%{rotate:0deg}50%{rotate:2.1deg}}
+/* 萤火虫：尾灯 + 呼吸光晕 + 拖尾（HTML 元素定位，避免 SVG 拉伸变形） */
+.grass .firefly{position:absolute;bottom:8px;width:6px;height:6px;opacity:0;
+  animation:firefly-float var(--fd,8s) ease-in-out var(--fdl,0s) infinite}
+.grass .firefly .ff-core{position:absolute;left:0;top:0;right:0;bottom:0;border-radius:50%;
+  background:#f4ffe9;box-shadow:0 0 7px 2px rgba(178,255,160,.9);
+  animation:ff-breathe calc(var(--fd,8s)*.45) ease-in-out infinite}
+.grass .firefly .ff-glow{position:absolute;left:-8px;top:-8px;width:22px;height:22px;border-radius:50%;
+  background:radial-gradient(circle, rgba(150,255,138,.42), transparent 68%);
+  animation:ff-breathe calc(var(--fd,8s)*.45) ease-in-out infinite}
+.grass .firefly .ff-tail{position:absolute;left:50%;bottom:3px;width:2px;height:16px;margin-left:-1px;border-radius:2px;
+  background:linear-gradient(to top, rgba(178,255,160,.55), transparent);transform-origin:50% 100%;
+  animation:ff-tail-pulse calc(var(--fd,8s)*.45) ease-in-out infinite}
+@keyframes firefly-float{0%{opacity:0;transform:translateY(10px) scale(.7)}16%{opacity:1}50%{opacity:.6;transform:translateY(-14px) translateX(5px) scale(1)}84%{opacity:.95}100%{opacity:0;transform:translateY(-28px) translateX(-4px) scale(.75)}}
+@keyframes ff-breathe{0%,100%{opacity:.25;transform:scale(.6)}50%{opacity:1;transform:scale(1.3)}}
+@keyframes ff-tail-pulse{0%,100%{opacity:.25;transform:scaleY(.55)}50%{opacity:.9;transform:scaleY(1.1)}}
+/* 尊重系统「减少动态效果」偏好 */
+@media (prefers-reduced-motion:reduce){
+  .grass .tuft,.grass .blade,.grass .firefly{animation:none}
+  .grass .firefly{opacity:0}
+}
 
 /* ================= 抓取版：编辑消息 / 空状态 / 取色器 / 昵称选择 ================= */
 .tl-item{position:relative}
