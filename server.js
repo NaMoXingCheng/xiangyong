@@ -4,12 +4,14 @@ const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
+const ai = require('./ai');
 
 const ROOT = __dirname;
 const PUBLIC = path.join(ROOT, 'public');
 // 数据目录：抓取版独立目录（环境变量 TA_LOVE_DATA 优先，否则用应用目录下 data/）
 const DATA = (process.env.TA_LOVE_DATA && process.env.TA_LOVE_DATA.trim()) || path.join(ROOT, 'data');
 const MSG_DIR = path.join(DATA, 'messages');
+ai.init(DATA);
 // 确保数据目录存在（首次运行自动创建）
 for (const d of [DATA, MSG_DIR]) { try { fs.mkdirSync(d, { recursive: true }); } catch (e) {} }
 // 聊天数据根目录：环境变量 TA_LOVE_WX > 当前用户 Documents\xwechat_files（仅用于读聊天软件自己生成的明文图片缩略图缓存）
@@ -833,6 +835,8 @@ function analyze(id, name, msgs, isGroup) {
   return {
     person: { id, name },
     msgCount: totalN,
+    dailyMsg: N / totalDays,
+    spans: { days: totalDays, msgN: totalN },
     imgStats,
     coldDays: Math.max(0, Math.round(lastGapDays)),
     nextAnniversary,
@@ -1141,6 +1145,35 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // ---------- 本地小AI：状态 / 下载准备 / 生成分析 ----------
+  if (req.method === 'GET' && p === '/api/ai/status') {
+    return json(res, ai.status());
+  }
+  if (req.method === 'POST' && p === '/api/ai/setup') {
+    ai.ensureModel(); // 异步下载+加载，进度经 /api/ai/status 轮询
+    return json(res, ai.status());
+  }
+  if (req.method === 'POST' && p === '/api/ai/enrich') {
+    if (!ai.installed()) return err(res, 503, 'AI 模型尚未安装，请先点击下载');
+    let body = '';
+    req.on('data', c => body += c);
+    req.on('end', async () => {
+      let b = {};
+      try { b = JSON.parse(body || '{}'); } catch (e) {}
+      const d = b.d;
+      if (!d || typeof d !== 'object') return err(res, 400, '缺少分析数据');
+      try {
+        await ai.ensureModel(); // 自愈：已安装则懒加载到内存（重启后首次生成会多花几秒）
+        if (!ai.status().ready) return err(res, 503, 'AI 加载中，请稍后重试');
+        const r = await ai.aiAnalyze(d);
+        return json(res, r);
+      } catch (e) {
+        return err(res, 500, e && e.message ? e.message : 'AI 生成失败');
+      }
+    });
+    return;
+  }
+
   // ---------- 全自动抓取（剪贴板监听导入） ----------
   if (req.method === 'POST' && p === '/api/grab/start') {
     if (grabSession && grabSession.running) return json(res, { ok: false, running: true });
@@ -1323,17 +1356,6 @@ const server = http.createServer((req, res) => {
     return json(res, { ok: true, id, pinned: person.pinned });
   }
 
-  // 自动分析标记：持久化 track 字段到 persons.json
-  if (req.method === 'PUT' && /^\/api\/person\/[^/]+\/track$/.test(p)) {
-    const id = p.split('/')[3];
-    const personsPath = path.join(DATA, 'persons.json');
-    const persons = readJson(personsPath) || [];
-    const person = persons.find(x => x.id === id);
-    if (!person) return err(res, 404, '未找到该联系人');
-    person.track = person.track ? false : true;
-    fs.writeFileSync(personsPath, JSON.stringify(persons, null, 1), 'utf8');
-    return json(res, { ok: true, id, track: person.track });
-  }
 
   // 删除联系人：从 persons.json 移除并删除消息缓存（写入备份，可恢复）
   if (req.method === 'DELETE' && /^\/api\/person\/[^/]+$/.test(p)) {
@@ -1349,9 +1371,11 @@ const server = http.createServer((req, res) => {
     trash.push(Object.assign({ deletedAt: Date.now() }, removed));
     fs.writeFileSync(trashPath, JSON.stringify(trash, null, 1), 'utf8');
     fs.writeFileSync(personsPath, JSON.stringify(persons, null, 1), 'utf8');
-    // 删除消息缓存文件
-    const msgFile = path.join(MSG_DIR, `${id}.json`);
-    if (fs.existsSync(msgFile)) fs.unlinkSync(msgFile);
+    // 删除消息缓存文件（unlink 失败不致命，仅跳过）
+    try {
+      const msgFile = path.join(MSG_DIR, `${id}.json`);
+      if (fs.existsSync(msgFile)) fs.unlinkSync(msgFile);
+    } catch (e) {}
     return json(res, { ok: true, removed: removed.name });
   }
 
@@ -1370,7 +1394,7 @@ const server = http.createServer((req, res) => {
       const id = md5hex('name:' + name);
       const person = {
         id, user: 'name:' + name, name, avatar: (name[0] || '?'),
-        msgs: 0, active: '', pct: 0, track: false, group: false,
+        msgs: 0, active: '', pct: 0, group: false,
         last: 0, first: 0, pinned: false,
         likes: [], deletedLikes: [], anniversaries: [], deletedAnniversaries: []
       };
@@ -1433,25 +1457,6 @@ const server = http.createServer((req, res) => {
   });
   fs.createReadStream(fp).pipe(res);
 });
-
-// ---------- 语音转写任务管理 ----------
-let batchJob = null; // 全量批量转写任务状态
-const BATCH_CONCURRENCY = 2; // 同时进行的联系人转写数，避免一次性拉起数百个 Whisper 进程
-
-// 全量批量转写：限流排队，逐个联系人触发 startTranscribe，轮询其完成后再取下一个
-
-
-
-// 单条同步转写：前端点击单条语音时等待结果返回
-
-// 批量转写：后台进程，通过 /status 轮询进度
-
-// ---------- 语音 AI 评估（本地规则引擎，后续可替换为 LLM） ----------
-const EVAL_POS = /喜欢|爱你|想你|开心|高兴|好呀|可以|没问题|幸福|期待|哈哈|嘻嘻|么么|晚安|早安|辛苦|棒|厉害|好听|好看|好吃|乖|抱抱|亲亲|行呀|好嘞|嗯嗯/;
-const EVAL_NEG = /讨厌|烦|生气|难过|伤心|累死|烦死|无语|算了|随便|不想|别这样|不行|不要|不好|失望|委屈|哭|叹气|呵呵|凭什么|凭什么|气死/;
-const EVAL_Q = /吗|呢|什么|怎么|哪|谁|几|多|吧[？?]|？|\?/;
-const EVAL_TOPIC = /吃|饭|睡|上班|下班|工作|学习|考试|电影|剧|游戏|歌|天气|买|家|爸妈|朋友|同事|周末|假期|旅游|旅|回家|到家|出门|见|来|去/;
-
 
 function json(res, obj) {
   res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });

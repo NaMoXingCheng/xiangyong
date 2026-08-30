@@ -7,6 +7,8 @@
   let searchQ = ''; // 联系人搜索词
   let todos = []; // 待办列表（localStorage 持久化）
   let settings = { importMode: 'all', importTimeDays: 365, importCount: 500 }; // 后端应用设置缓存
+  let aiState = { ready: false, downloading: false, progress: 0, installed: false, error: null }; // 本地小AI 状态缓存
+  let enrichSeq = 0; // 单调序号：只让最新一次请求生效，避免切换联系人时结果错位
 
   // ---------- 访问口令（局域网明文聊天保护，opt-in） ----------
   const _TA_PWD_KEY = 'ta_love_pwd';
@@ -136,7 +138,6 @@
         <div class="ops">
           <span class="op pin ${pins.includes(p.id) ? 'on' : ''}" title="置顶">${pins.includes(p.id) ? '★' : '☆'}</span>
           <span class="op del" title="删除">×</span>
-          <span class="ck ${p.track ? 'on' : ''}" title="勾选 = 自动分析，留空 = 仅存档">${p.track ? '✓' : '□'}</span>
         </div>
       </div>`).join('');
     listEl.querySelectorAll('.person').forEach(el => {
@@ -160,22 +161,6 @@
           persons = persons.filter(x => x.id !== el.dataset.id);
           if (current && current.id === el.dataset.id) { current = null; main.innerHTML = `<div class="ph">← 选择左侧联系人查看分析</div>`; }
           renderList();
-        });
-      });
-      el.querySelector('.ck').addEventListener('click', e => {
-        e.stopPropagation();
-        const p = persons.find(x => x.id === el.dataset.id);
-        const target = !p.track;
-        p.track = target;
-        el.querySelector('.ck').classList.toggle('on', target);
-        el.querySelector('.ck').textContent = target ? '✓' : '□';
-        fetch('/api/person/' + el.dataset.id + '/track', { method: 'PUT' }).then(r => {
-          if (!r.ok) {
-            p.track = !target;
-            el.querySelector('.ck').classList.toggle('on', p.track);
-            el.querySelector('.ck').textContent = p.track ? '✓' : '□';
-            alert('自动分析标记保存失败');
-          }
         });
       });
     });
@@ -225,6 +210,7 @@
     const v = $('#viewRoot');
     requestAnimationFrame(() => requestAnimationFrame(() => v.classList.add('in')));
     bindMain(d);
+    if (aiState.installed) tryEnrichAi(d, id); // 本地AI 已安装时自动生成锐评/洞察
     // 联系人切换后右侧自动回到顶部，避免用户手动上翻
     window.scrollTo({ top: 0, behavior: 'smooth' });
     main.scrollTop = 0;
@@ -240,6 +226,64 @@
       ${rows}
       ${advice}
     </div>`;
+  }
+
+  // ---------- 本地小AI：状态条 / 下载 / 生成 ----------
+  function renderAiBar() {
+    const bar = $('#aiBar');
+    if (!bar) return;
+    const s = aiState;
+    let cls = 'ai-bar', html;
+    if (s.ready) { cls += ' ok'; html = '🧠 本地AI 已就绪'; }
+    else if (s.downloading) { cls += ' busy'; html = '🧠 正在下载本地AI ' + (s.progress || 0) + '%'; }
+    else if (s.installed) { cls += ' ok'; html = '🧠 本地AI 已安装 · 加载中'; }
+    else { cls += ' off'; html = '🧠 本地AI 未安装 · 点此下载（约 2GB，仅首次）'; }
+    bar.className = cls;
+    bar.innerHTML = html;
+  }
+  function pollAiStatus() {
+    fetch('/api/ai/status').then(r => r.json()).then(s => { aiState = s; renderAiBar(); }).catch(() => {});
+  }
+  function bindAi() {
+    const bar = $('#aiBar');
+    if (bar) bar.addEventListener('click', () => {
+      if (aiState.downloading || aiState.ready) return;
+      toast('开始下载本地AI模型，请稍候（仅首次，之后完全离线）', 'info', 5000);
+      fetch('/api/ai/setup', { method: 'POST' }).then(r => r.json()).then(s => { aiState = s; renderAiBar(); }).catch(() => {});
+    });
+  }
+  function aiExtrasCard(d, ai) {
+    const mood = ai.mood ? `<div class="ai-mood"><span class="ai-mood-tt">情感基调</span><span class="ai-mood-body">${esc(ai.mood)}</span></div>` : '';
+    const insights = (ai.insights && ai.insights.length) ? `<div class="ai-insight"><span class="ra-tt">关系洞察</span>${ai.insights.map(l => `<div class="ai-insight-line">${esc(l)}</div>`).join('')}</div>` : '';
+    if (!mood && !insights) return '';
+    return `<div class="roast ai-extras">
+      <div class="roast-head"><span class="roast-tt">本地AI · 情感与洞察</span><span class="roast-sub">Qwen2.5-3B · 本地生成</span></div>
+      ${mood}
+      ${insights}
+    </div>`;
+  }
+  async function tryEnrichAi(d, id) {
+    if (!aiState.installed || d.group) return;
+    const seq = ++enrichSeq;
+    const roast = document.querySelector('.roast');
+    if (roast) roast.classList.add('ai-thinking');
+    try {
+      const resp = await fetch('/api/ai/enrich', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ d }) });
+      if (!resp.ok) return;
+      const ai = await resp.json();
+      if (!ai || !ai.ok) return;
+      if (seq !== enrichSeq || (current && current.id !== id)) return; // 期间切走/又触发，丢弃
+      const card = aiExtrasCard(d, ai);
+      if (!card) return;
+      const tmp = document.createElement('div');
+      tmp.innerHTML = card;
+      const node = tmp.firstElementChild;
+      const cur = document.querySelector('.roast');
+      if (cur) cur.insertAdjacentElement('afterend', node);
+      else { const v = $('#viewRoot'); if (v) v.insertAdjacentHTML('afterbegin', card); }
+    } catch (e) {} finally {
+      if (seq === enrichSeq) { const r = document.querySelector('.roast'); if (r) r.classList.remove('ai-thinking'); }
+    }
   }
 
   // ---------- 半圆仪表盘 ----------
@@ -445,16 +489,10 @@
     if (m.vFail) {
       return `<div class="vox dead" data-svr="${svr}"><span class="vox-ic">♪</span><span class="vox-t">${esc(m.text)}</span><span class="vox-dead">语音已失效（数据已被清理）</span></div>`;
     }
-    const edit = m.vt ? `<i class="vt-edit" title="编辑转写">✎</i>` : '';
-    const vt = m.vt ? `<div class="vox-vt"><span class="vt-txt">${esc(m.vt)}</span>${edit}</div>` : '';
-    const fold = m.vt ? `<i class="vox-fold" title="折叠/展开转写">▾</i>` : '';
-    const act = m.vt
-      ? `<div class="vox-done"><span class="vox-ok">✓ 已转写</span><button class="vt-btn" data-svr="${svr}" data-again="1">重新转写</button></div>`
-      : `<button class="vt-btn" data-svr="${svr}">转写</button>`;
-    return `<div class="vox" data-svr="${svr}"><span class="vox-head"><span class="vox-ic">♪</span><span class="vox-t">${esc(m.text)}</span>${fold}</span>${vt}${act}</div>`;
+    const vt = m.vt ? `<div class="vox-vt"><span class="vt-txt">${esc(m.vt)}</span></div>` : '';
+    return `<div class="vox" data-svr="${svr}"><span class="vox-head"><span class="vox-ic">♪</span><span class="vox-t">${esc(m.text)}</span></span>${vt}</div>`;
   }
   function timelineCard(d) {
-    const hasVoice = d.timeline.some(m => m.voice);
     const items = d.timeline.map(m => {
       const emojiChip = m.emoji && m.en ? `<span class="img-badge emoji-chip">${esc(m.en)}</span>` : '';
       const badge = m.img ? (m.emoji ? (emojiChip || '<span class="img-badge">表情</span>') : '<span class="img-badge">图片</span>') : '';
@@ -477,8 +515,7 @@
         ${editBtn}${editedMark}${todoBtn}
       </div>`;
     }).join('');
-    const bar = hasVoice ? `<div class="tl-bar"><button class="ab" id="transAll">转写全部语音</button><span id="transProg" class="trans-prog"></span></div>` : '';
-    return `<div class="sec-t">对话时间线 · 可溯源</div>${bar}<div class="tl" id="tl">${items}</div>`;
+    return `<div class="sec-t">对话时间线 · 可溯源</div><div class="tl" id="tl">${items}</div>`;
   }
 
   // ---------- 图片/表情统计卡 ----------
@@ -523,11 +560,7 @@
 
   // ---------- 结论卡 ----------
   function conclCard(d) {
-    const voices = d.timeline.filter(m => m.voice && m.vt && !m.vFail).length;
-    const evalBar = voices
-      ? `<div class="eval-bar"><button class="ab ev-re" id="reEval">↻ 手动 AI 评估</button><span class="eval-hint">基于已转写语音与文本重新生成结论</span></div>`
-      : `<div class="eval-bar dim"><span class="eval-hint">语音已转写后可在此触发手动 AI 评估</span></div>`;
-    return `<div class="sec-t">AI 结论 · 依据可溯源</div>${evalBar}` + d.conclusions.map((c, ci) => `
+    return `<div class="sec-t">AI 结论 · 依据可溯源</div>` + d.conclusions.map((c, ci) => `
       <div class="concl" data-i="${ci}">
         <div class="head"><span class="b ${c.level}">${c.tag}</span> ${c.title}<span class="sc">${c.score}</span></div>
         <p>${c.summary}</p>
@@ -720,153 +753,10 @@
         .catch(() => {})
         .finally(() => { reanalyzing = false; });
     }
-    function replaceVoiceDom(svr, vtText, vFail) {
-      const old = document.querySelector(`.vox[data-svr="${svr}"]`);
-      if (!old) return;
-      const txt = old.querySelector('.vox-t') ? old.querySelector('.vox-t').textContent : '语音';
-      const div = document.createElement('div');
-      div.innerHTML = voiceBody({ voice: true, svr, vt: vtText || '', vFail: !!vFail, text: txt });
-      const nu = div.firstElementChild;
-      old.replaceWith(nu);
-      bindVoiceActions(pid, nu);
-    }
-    function bindVoiceActions(pid, root) {
-      // 折叠：点击语音头部切换转写文本显隐
-      const head = root.querySelector ? root.querySelector('.vox-head') : null;
-      if (head) head.addEventListener('click', e => {
-        if (e.target.closest('.vt-edit')) return;
-        const vox = head.closest('.vox');
-        vox.classList.toggle('collapsed');
-        const fold = vox.querySelector('.vox-fold');
-        if (fold) fold.textContent = vox.classList.contains('collapsed') ? '▸' : '▾';
-      });
-      // 单条转写
-      root.querySelectorAll('.vt-btn').forEach(btn => btn.addEventListener('click', () => {
-        const svr = btn.dataset.svr;
-        if (!svr) return;
-        const again = btn.dataset.again;
-        btn.disabled = true;
-        btn.textContent = '转写中…';
-        fetch('/api/person/' + pid + '/transcribe', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ svr })
-        }).then(r => r.json()).then(d => {
-          if (!d.ok) {
-            if (/过期|清理|not found/i.test(d.message || '')) { toast('该条语音数据已失效，无法转写', 'warn'); replaceVoiceDom(svr, '', true); }
-            else toast('转写失败：' + (d.message || '未知错误'), 'err');
-            return;
-          }
-          toast(again ? '已重新转写' : '转写完成', 'ok', 2000);
-          replaceVoiceDom(svr, d.text || '', false);
-          refreshConclusions();
-        }).catch(() => { toast('转写请求失败', 'err'); btn.disabled = false; btn.textContent = '转写'; });
-      }));
-      // 编辑转写
-      root.querySelectorAll('.vt-edit').forEach(ed => ed.addEventListener('click', e => {
-        e.stopPropagation();
-        const box = ed.closest('.vox-vt');
-        const svr = box.closest('.vox').querySelector('[data-svr]').dataset.svr;
-        const old = box.querySelector('.vt-txt').textContent;
-        const val = prompt('编辑转写文本：', old);
-        if (val == null) return;
-        const text = val.trim();
-        if (!text) return;
-        fetch('/api/person/' + pid + '/transcribe', {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ svr, text })
-        }).then(r => r.json()).then(d => {
-          if (!d.ok) { toast('保存失败：' + (d.message || '未知错误'), 'err'); return; }
-          toast('已保存', 'ok', 1800);
-          const t = box.querySelector('.vt-txt');
-          if (t) t.textContent = text;
-          refreshConclusions();
-        }).catch(() => toast('保存请求失败', 'err'));
-      }));
-    }
-    // 绑定当前页面所有语音条
-    main.querySelectorAll('.vox').forEach(vox => bindVoiceActions(pid, vox));
 
-    // ---------- 语音：手动 AI 评估（结论栏上方，基于已转写语音全量重算） ----------
-    const reEval = main.querySelector('#reEval');
-    if (reEval) reEval.addEventListener('click', () => {
-      reEval.disabled = true;
-      reEval.textContent = '评估中…';
-      fetch('/api/person/' + pid + '/reanalyze', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) })
-        .then(r => r.json()).then(d => {
-          if (!d.ok) { toast('评估失败：' + (d.message || '未知错误'), 'err'); return; }
-          toast(`AI 评估完成 · 基于 ${d.msgCount} 条消息`, 'ok');
-          refreshConclusions();
-        })
-        .catch(() => { toast('评估请求失败', 'err'); })
-        .finally(() => { reEval.disabled = false; reEval.textContent = '↻ 手动 AI 评估'; });
-    });
 
-    // ---------- 语音：批量转写（完成后仅局部刷新，不整页重载） ----------
-    const transAll = main.querySelector('#transAll');
-    if (transAll) transAll.addEventListener('click', () => {
-      if (transAll.disabled) return;
-      transAll.disabled = true;
-      transAll.textContent = '转写中…';
-      const prog = $('#transProg');
-      prog.textContent = '0/0';
-      fetch('/api/person/' + pid + '/transcribe', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({})
-      }).then(r => r.json()).then(d => {
-        if (!d.ok) { toast('启动失败：' + (d.message || '未知错误'), 'err'); return; }
-        const timer = setInterval(() => {
-          fetch('/api/person/' + pid + '/transcribe/status').then(r => r.json()).then(s => {
-            prog.textContent = s.total ? `${s.done}/${s.total}` : '0/0';
-            if (!s.running && s.done >= s.total && s.total > 0) {
-              clearInterval(timer);
-              transAll.disabled = false;
-              transAll.textContent = '转写全部语音';
-              toast(s.missing ? `转写完成 ${s.done} 条，${s.missing} 条语音已失效` : `转写完成 ${s.done} 条`, s.missing ? 'warn' : 'ok', 5000);
-              refreshConclusions();
-            }
-          }).catch(() => {});
-        }, 1500);
-      }).catch(() => { toast('启动失败', 'err'); transAll.disabled = false; transAll.textContent = '转写全部语音'; });
-    });
-
-    // ---------- 语音：打开联系人后自动转写（仅时间线内未转写语音，串行后台执行，不刷新页面） ----------
-    if (!d.group) {
-      const pend = (d.timeline || []).filter(m => m.voice && !m.vt && !m.vFail);
-      if (pend.length) {
-        const bar = $('#transProg');
-        const btn = $('#transAll');
-        let done = 0;
-        if (btn) btn.disabled = true;
-        if (bar) bar.textContent = `自动转写 0/${pend.length}`;
-        const run = i => {
-          if (i >= pend.length) {
-            if (bar) bar.textContent = '';
-            if (btn) { btn.disabled = false; btn.textContent = '转写全部语音'; }
-            refreshConclusions();
-            return;
-          }
-          fetch('/api/person/' + pid + '/transcribe', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ svr: pend[i].svr })
-          }).then(r => r.json()).then(dd => {
-            done++;
-            if (bar) bar.textContent = `自动转写 ${done}/${pend.length}`;
-            if (dd.ok) replaceVoiceDom(pend[i].svr, dd.text || '', false);
-            else replaceVoiceDom(pend[i].svr, '', true);
-            setTimeout(() => run(i + 1), 400);
-          }).catch(() => { done++; setTimeout(() => run(i + 1), 400); });
-        };
-        run(0);
-      }
-    }
   }
 
-  // ---------- 批量导入全部联系人 ----------
-  let importTimer = null;
 
   // ---------- 新建联系人（抓取版：仅按昵称） ----------
   function bindImportOne() {
@@ -1278,6 +1168,9 @@
   bindTodo();
   bindSettings();
   bindGrab();
+  bindAi();
+  pollAiStatus();
+  setInterval(pollAiStatus, 3000); // 轮询模型下载进度/就绪态
   loadPersons();
   bindImportOne();
 })();
