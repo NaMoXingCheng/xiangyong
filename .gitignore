@@ -10,3 +10,7 @@ temp/
 screenshots/
 .DS_Store
 Thumbs.db
+
+# 赛事提交材料（本地提交用，不进公开仓库）
+shithon提交信息.txt
+相拥-封面.png
