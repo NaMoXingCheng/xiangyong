@@ -12,5 +12,8 @@
   },
   "dependencies": {
     "node-llama-cpp": "^3.20.0"
+  },
+  "optionalDependencies": {
+    "@node-llama-cpp/win-x64-vulkan": "3.20.0"
   }
 }

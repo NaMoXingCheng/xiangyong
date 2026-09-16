@@ -210,60 +210,234 @@
     const v = $('#viewRoot');
     requestAnimationFrame(() => requestAnimationFrame(() => v.classList.add('in')));
     bindMain(d);
-    if (aiState.installed) tryEnrichAi(d, id); // 本地AI 已安装时自动生成锐评/洞察
+    bindRoastAi(d);
+    if (aiState.ready) tryEnrichAi(d, id); // 本地AI 就绪时自动补「情感基调 / 关系洞察」
     // 联系人切换后右侧自动回到顶部，避免用户手动上翻
     window.scrollTo({ top: 0, behavior: 'smooth' });
     main.scrollTop = 0;
   }
 
-  // ---------- AI 锐评（毒舌但友好 + 狗头军师建议） ----------
+  // ---------- AI 锐评（模板打底 + 可一键让本地模型重写） ----------
   function roastCard(d) {
     const r = d.roast;
     const rows = r.lines.map(l => `<div class="roast-line">${esc(l)}</div>`).join('');
     const advice = r.advice ? `<div class="roast-advice"><span class="ra-tt">${esc(r.adviceTitle || '狗头军师 · 相处建议')}</span><div class="ra-body">${esc(r.advice)}</div></div>` : '';
-    return `<div class="roast">
-      <div class="roast-head"><span class="roast-tt">${esc(r.title)}</span><span class="roast-sub">${esc(r.sub)}</span></div>
-      ${rows}
+    return `<div class="roast" data-roast-id="${esc(d.id || '')}">
+      <div class="roast-head">
+        <span class="roast-tt">${esc(r.title)}</span><span class="roast-sub">${esc(r.sub)}</span>
+        <button class="roast-ai-btn" id="roastAiBtn" title="用本地 AI 重新写一版，每次都不一样">✦ AI 重写</button>
+      </div>
+      <div class="roast-lines">${rows}</div>
       ${advice}
     </div>`;
   }
+  // 「AI 重写」：把模板锐评换成模型现场写的，内容只在本机生成
+  function bindRoastAi(d) {
+    const btn = document.getElementById('roastAiBtn');
+    if (!btn) return;
+    const original = btn.textContent;
+    btn.addEventListener('click', async () => {
+      if (!aiState.ready) {
+        toast('先选一个本地 AI 模型，再让它写锐评', 'info', 3200);
+        openAiPanel();
+        return;
+      }
+      const card = btn.closest('.roast');
+      if (!card) return;
+      const holder = card.querySelector('.roast-lines');
+      const backup = holder ? holder.innerHTML : '';
+      btn.disabled = true;
+      btn.textContent = '生成中…';
+      card.classList.add('ai-thinking');
+      try {
+        const resp = await fetch('/api/ai/roast', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ d }),
+        });
+        const j = await resp.json();
+        if (!resp.ok || !j || !j.ok) throw new Error((j && j.error) || ('HTTP ' + resp.status));
+        if (holder) {
+          // 模型没引用到真实数字时明确说出来——编造的数据比模板更误导人
+          const caveat = j.grounded === false
+            ? '<div class="roast-line ai-caveat">这一版模型没引用到统计里的真实数字，参考着看，别当真。</div>'
+            : '';
+          holder.innerHTML = `<div class="roast-line ai-made">${esc(j.roast)}</div>${caveat}`;
+        }
+        const sub = card.querySelector('.roast-sub');
+        if (sub) sub.textContent = 'AI 现场生成 · ' + (j.model || '');
+        btn.textContent = '✦ 换一版';
+        toast('已由 ' + (j.model || '本地模型') + ' 生成', 'info', 2400);
+      } catch (e) {
+        if (holder) holder.innerHTML = backup;
+        btn.textContent = original;
+        toast('生成失败：' + (e && e.message ? e.message : '未知错误'), 'error', 4200);
+      } finally {
+        btn.disabled = false;
+        card.classList.remove('ai-thinking');
+      }
+    });
+  }
 
-  // ---------- 本地小AI：状态条 / 下载 / 生成 ----------
+  // ---------- 本地小AI：状态条 / 模型选择 / 生成 ----------
+  function aiModelLabel() {
+    const s = aiState;
+    if (!s.ready) return '';
+    if (s.backend === 'ollama') return s.model || '本机模型';
+    if (s.backend === 'builtin') {
+      const t = (s.tiers || []).find(x => x.key === s.tier);
+      return t ? ('内置 ' + t.params) : '内置模型';
+    }
+    return s.model || '';
+  }
   function renderAiBar() {
     const bar = $('#aiBar');
     if (!bar) return;
     const s = aiState;
     let cls = 'ai-bar', html;
-    if (s.ready) { cls += ' ok'; html = '🧠 本地AI 已就绪'; }
-    else if (s.downloading) { cls += ' busy'; html = '🧠 正在下载本地AI ' + (s.progress || 0) + '%'; }
-    else if (s.installed) { cls += ' ok'; html = '🧠 本地AI 已安装 · 加载中'; }
-    else { cls += ' off'; html = '🧠 本地AI 未安装 · 点此下载（约 2GB，仅首次）'; }
+    if (s.downloading) {
+      cls += ' busy';
+      html = '🧠 正在下载内置模型 ' + (s.progress || 0) + '%';
+    } else if (s.ready) {
+      cls += ' ok';
+      html = '🧠 ' + (s.backend === 'ollama' ? '本机 Ollama' : '内置模型') + ' · ' + esc(aiModelLabel());
+    } else if (s.ollamaReady && (s.ollamaModels || []).some(m => m.usable)) {
+      cls += ' off';
+      html = '🧠 发现本机 Ollama · 点此启用（零下载）';
+    } else if (s.installed) {
+      cls += ' ok';
+      html = '🧠 内置模型已下载 · 点此加载';
+    } else {
+      cls += ' off';
+      html = '🧠 本地AI 未启用 · 点此选择模型';
+    }
     bar.className = cls;
+    bar.title = s.ready
+      ? ('当前模型：' + (s.model || '') + '　点击更换')
+      : '点击选择本地 AI 模型';
     bar.innerHTML = html;
   }
   function pollAiStatus() {
-    fetch('/api/ai/status').then(r => r.json()).then(s => { aiState = s; renderAiBar(); }).catch(() => {});
+    return fetch('/api/ai/status').then(r => r.json()).then(s => { aiState = s; renderAiBar(); return s; }).catch(() => null);
+  }
+  // 下载期间持续轮询（每 1.2 秒），下完自动停，并提示用户
+  let aiPollTimer = null;
+  function startAiPolling() {
+    if (aiPollTimer) return;
+    aiPollTimer = setInterval(async () => {
+      const s = await pollAiStatus();
+      if (!s) return;
+      if (!s.downloading) {
+        clearInterval(aiPollTimer); aiPollTimer = null;
+        if (s.ready) {
+          toast('本地 AI 已就绪 · ' + aiModelLabel(), 'info', 4000);
+          if (current) tryEnrichAi(current, current.id);
+        } else if (s.error) {
+          toast(s.error, 'error', 6000);
+        }
+      }
+    }, 1200);
   }
   function bindAi() {
     const bar = $('#aiBar');
-    if (bar) bar.addEventListener('click', () => {
-      if (aiState.downloading || aiState.ready) return;
-      toast('开始下载本地AI模型，请稍候（仅首次，之后完全离线）', 'info', 5000);
-      fetch('/api/ai/setup', { method: 'POST' }).then(r => r.json()).then(s => { aiState = s; renderAiBar(); }).catch(() => {});
+    if (bar) bar.addEventListener('click', openAiPanel);
+  }
+
+  // 模型选择面板：本机 Ollama（零下载）+ 内置三档（给别人下载用）
+  function openAiPanel() {
+    const old = document.getElementById('aiPanel');
+    if (old) { old.remove(); return; }
+    const s = aiState;
+
+    const ollamaList = s.ollamaModels || [];
+    const ollamaHtml = !s.ollamaReady
+      ? '<div class="ai-empty">没检测到本机 Ollama 服务。<br>装了 Ollama 的话，启动它就能零下载直接使用。</div>'
+      : (ollamaList.length
+        ? ollamaList.map(m => `
+            <button class="ai-opt${m.usable ? '' : ' bad'}${s.backend === 'ollama' && s.model === m.name ? ' cur' : ''}" data-model="${esc(m.name)}"${m.usable ? '' : ' disabled'}>
+              <span class="ao-name">${esc(m.name)}</span>
+              <span class="ao-meta">${esc(m.params || '')}${m.params ? ' · ' : ''}${m.sizeGB ? m.sizeGB + ' GB' : ''}${m.note ? ' · ' + esc(m.note) : ''}</span>
+            </button>`).join('')
+        : '<div class="ai-empty">Ollama 在运行，但里面还没有对话模型。</div>');
+
+    const tiersHtml = (s.tiers || []).map(t => `
+      <button class="ai-opt${t.installed ? ' inst' : ''}${s.backend === 'builtin' && s.tier === t.key ? ' cur' : ''}" data-tier="${t.key}">
+        <span class="ao-name">${esc(t.label)} · ${esc(t.params)}${t.installed ? '<i>已下载</i>' : ''}</span>
+        <span class="ao-meta">下载 ${t.sizeGB} GB · 建议显存 ≥ ${t.minVRAM} GB · ${esc(t.desc)}</span>
+      </button>`).join('');
+
+    const ov = document.createElement('div');
+    ov.id = 'aiPanel';
+    ov.className = 'ai-panel-mask';
+    ov.innerHTML = `<div class="ai-panel">
+      <div class="ai-panel-head">
+        <span class="ap-tt">本地 AI 模型</span>
+        <button class="ap-close" id="apClose">×</button>
+      </div>
+      <div class="ai-panel-body">
+        <div class="ap-sec">
+          <div class="ap-sec-tt">用本机 Ollama<span class="ap-tag">零下载</span></div>
+          <div class="ap-grid">${ollamaHtml}</div>
+        </div>
+        <div class="ap-sec">
+          <div class="ap-sec-tt">下载内置模型<span class="ap-tag gray">分发给别人走这条</span></div>
+          <div class="ap-grid">${tiersHtml}</div>
+        </div>
+        <div class="ap-foot">
+          锐评提示词已内置，模型选好就自动生效，你不用填任何东西。所有推理都在本机完成，聊天内容不会上传。<br>
+          下载中断不要紧，再点一次会接着下（断点续传）。显存不够也能跑，只是会慢一些。
+        </div>
+      </div>
+    </div>`;
+    document.body.appendChild(ov);
+
+    ov.addEventListener('click', (e) => {
+      if (e.target === ov || e.target.id === 'apClose') ov.remove();
     });
+
+    ov.querySelectorAll('.ai-opt[data-model]').forEach(btn => btn.addEventListener('click', async () => {
+      const name = btn.dataset.model;
+      toast('正在启用 ' + name + '…', 'info', 3000);
+      try {
+        const r = await fetch('/api/ai/setup', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ backend: 'ollama', model: name }),
+        });
+        aiState = await r.json();
+        renderAiBar();
+        toast(aiState.ready ? ('已启用：' + name) : ('启用失败：' + (aiState.error || '未知')), aiState.ready ? 'info' : 'error', 3200);
+        const p = document.getElementById('aiPanel'); if (p) p.remove();
+        if (aiState.ready && current) tryEnrichAi(current, current.id);
+      } catch (e) { toast('启用失败：' + e.message, 'error', 3200); }
+    }));
+
+    ov.querySelectorAll('.ai-opt[data-tier]').forEach(btn => btn.addEventListener('click', async () => {
+      const key = btn.dataset.tier;
+      const t = (aiState.tiers || []).find(x => x.key === key) || {};
+      toast('正在准备内置模型 · ' + (t.params || '') + '（约 ' + (t.sizeGB || '') + ' GB，仅首次需要下载）', 'info', 4500);
+      const p = document.getElementById('aiPanel'); if (p) p.remove();
+      try {
+        const r = await fetch('/api/ai/setup', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ backend: 'builtin', tier: key }),
+        });
+        aiState = await r.json();
+        renderAiBar();
+        startAiPolling();       // 下载中：持续刷新进度，下完自动提示
+      } catch (e) { toast('准备失败：' + e.message, 'error', 3200); }
+    }));
   }
   function aiExtrasCard(d, ai) {
     const mood = ai.mood ? `<div class="ai-mood"><span class="ai-mood-tt">情感基调</span><span class="ai-mood-body">${esc(ai.mood)}</span></div>` : '';
     const insights = (ai.insights && ai.insights.length) ? `<div class="ai-insight"><span class="ra-tt">关系洞察</span>${ai.insights.map(l => `<div class="ai-insight-line">${esc(l)}</div>`).join('')}</div>` : '';
     if (!mood && !insights) return '';
     return `<div class="roast ai-extras">
-      <div class="roast-head"><span class="roast-tt">本地AI · 情感与洞察</span><span class="roast-sub">Qwen2.5-3B · 本地生成</span></div>
+      <div class="roast-head"><span class="roast-tt">本地AI · 情感与洞察</span><span class="roast-sub">${esc(ai.model || '本地生成')}</span></div>
       ${mood}
       ${insights}
     </div>`;
   }
   async function tryEnrichAi(d, id) {
-    if (!aiState.installed || d.group) return;
+    if (d.group || !aiState.ready) return; // 没启用本地AI 就不自动跑，省算力
     const seq = ++enrichSeq;
     const roast = document.querySelector('.roast');
     if (roast) roast.classList.add('ai-thinking');
@@ -998,9 +1172,37 @@
 
   // ================= 左侧 To-Do =================
   const TODO_KEY = 'ta_love_todos';
+  const TODO_KEEP_KEY = 'ta_love_todo_keep';   // '1' = 永久保留已完成，不自动清理
+  const TODO_KEEP_DAYS = 15;                   // 已完成项默认保留天数
+  const DAY_MS = 86400000;
+  let todoKeepForever = false;
+  let todoPrunedOnBoot = 0;                    // 本次启动自动清理了几条（用于提示）
+
+  function loadTodoKeep() {
+    try { todoKeepForever = localStorage.getItem(TODO_KEEP_KEY) === '1'; } catch (e) { todoKeepForever = false; }
+  }
+  function saveTodoKeep() {
+    try { localStorage.setItem(TODO_KEEP_KEY, todoKeepForever ? '1' : '0'); } catch (e) {}
+  }
+  // 已完成项超过保留期 → 自动清空（永久保留模式直接跳过）
+  function pruneDoneTodos() {
+    if (todoKeepForever) return 0;
+    const now = Date.now();
+    const before = todos.length;
+    todos = todos.filter(t => {
+      if (!t.done) return true;
+      if (!t.doneAt) { t.doneAt = now; return true; }  // 老数据没有完成时间，从现在起算
+      return now - t.doneAt <= TODO_KEEP_DAYS * DAY_MS;
+    });
+    const removed = before - todos.length;
+    if (removed) saveTodos();
+    return removed;
+  }
   function loadTodos() {
+    loadTodoKeep();
     try { todos = JSON.parse(localStorage.getItem(TODO_KEY) || '[]'); } catch (e) { todos = []; }
     if (!Array.isArray(todos)) todos = [];
+    todoPrunedOnBoot = pruneDoneTodos();
   }
   function saveTodos() {
     try { localStorage.setItem(TODO_KEY, JSON.stringify(todos)); } catch (e) {}
@@ -1008,9 +1210,16 @@
   function addTodo(text) {
     const t = String(text || '').trim();
     if (!t) return;
-    todos.unshift({ id: 'td-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6), text: t, done: false, ts: Date.now() });
+    todos.unshift({ id: 'td-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6), text: t, done: false, doneAt: 0, ts: Date.now() });
     saveTodos();
     renderTodos();
+  }
+  // 已完成项「最早那一条」还剩几天被清掉
+  function daysLeftForDone() {
+    const done = todos.filter(t => t.done && t.doneAt);
+    if (!done.length) return null;
+    const oldest = Math.min(...done.map(t => t.doneAt));
+    return Math.max(0, Math.ceil((oldest + TODO_KEEP_DAYS * DAY_MS - Date.now()) / DAY_MS));
   }
   function todoRoast() {
     const total = todos.length;
@@ -1059,7 +1268,7 @@
       listEl.querySelectorAll('.todo-item').forEach(item => {
         item.querySelector('.todo-check').addEventListener('click', () => {
           const t = todos.find(x => x.id === item.dataset.id);
-          if (t) { t.done = !t.done; saveTodos(); renderTodos(); }
+          if (t) { t.done = !t.done; t.doneAt = t.done ? Date.now() : 0; saveTodos(); renderTodos(); }
         });
         item.querySelector('.todo-del').addEventListener('click', () => {
           todos = todos.filter(x => x.id !== item.dataset.id);
@@ -1071,6 +1280,43 @@
       const r = todoRoast();
       roastEl.innerHTML = `<span class="tr-tt">${esc(r.title)}</span>${esc(r.body)}<span class="tr-advice">狗头军师：${esc(r.advice)}</span>`;
     }
+    renderTodoArchive();
+  }
+  // ---------- 已完成归档条：只在有已完成项时出现 ----------
+  function renderTodoArchive() {
+    const el = $('#todoArchive');
+    if (!el) return;
+    const doneItems = todos.filter(t => t.done);
+    if (!doneItems.length) { el.classList.add('hide'); el.innerHTML = ''; return; }
+    const n = doneItems.length;
+    const left = daysLeftForDone();
+    const tip = todoKeepForever
+      ? `已完成 ${n} · 永久保留`
+      : (left === null ? `已完成 ${n}` : `已完成 ${n} · 最早 ${left} 天后清空`);
+    el.classList.remove('hide');
+    el.innerHTML = `<span class="ta-tip">${tip}</span>` +
+      `<button class="ta-btn ta-keep${todoKeepForever ? ' on' : ''}" id="todoKeepBtn" title="${todoKeepForever ? '已开启永久保留 · 点击恢复自动清理' : `开启后已完成项永久保留，不再 ${TODO_KEEP_DAYS} 天自动清空`}">保留</button>` +
+      `<button class="ta-btn ta-clear" id="todoClearDone" title="立即清空所有已完成">清空</button>`;
+    const keepBtn = el.querySelector('#todoKeepBtn');
+    const clearBtn = el.querySelector('#todoClearDone');
+    if (keepBtn) keepBtn.addEventListener('click', () => {
+      todoKeepForever = !todoKeepForever;
+      saveTodoKeep();
+      if (todoKeepForever) {
+        toast('已开启永久保留：已完成的待办不再自动清空', 'info', 3000);
+      } else {
+        const removed = pruneDoneTodos();
+        toast(removed ? `已恢复自动清理，顺手清掉 ${removed} 项超期项` : `已恢复自动清理：完成满 ${TODO_KEEP_DAYS} 天自动移除`, 'info', 3000);
+      }
+      renderTodos();
+    });
+    if (clearBtn) clearBtn.addEventListener('click', () => {
+      const k = doneItems.length;
+      todos = todos.filter(t => !t.done);
+      saveTodos();
+      renderTodos();
+      toast(`已清空 ${k} 项已完成的待办`, 'info', 2400);
+    });
   }
   function bindTodo() {
     const addBtn = $('#todoAdd');
@@ -1198,6 +1444,9 @@
   loadTodos();
   renderTodos();
   bindTodo();
+  if (todoPrunedOnBoot) {
+    setTimeout(() => toast(`已按 ${TODO_KEEP_DAYS} 天规则自动清空 ${todoPrunedOnBoot} 项已完成的待办`, 'info', 3600), 900);
+  }
   bindSettings();
   bindGrab();
   bindAi();

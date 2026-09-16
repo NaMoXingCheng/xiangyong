@@ -1145,16 +1145,39 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // ---------- 本地小AI：状态 / 下载准备 / 生成分析 ----------
+  // ---------- 本地小AI：状态 / 后端探测 / 准备模型 / 生成 ----------
   if (req.method === 'GET' && p === '/api/ai/status') {
     return json(res, ai.status());
   }
-  if (req.method === 'POST' && p === '/api/ai/setup') {
-    ai.ensureModel(); // 异步下载+加载，进度经 /api/ai/status 轮询
-    return json(res, ai.status());
+  // 重新探测本机 Ollama（用户可能刚启动服务），结果写回 status
+  if (req.method === 'POST' && p === '/api/ai/probe') {
+    ai.detectOllama()
+      .then(() => json(res, ai.status()))
+      .catch(() => json(res, ai.status()));
+    return;
   }
-  if (req.method === 'POST' && p === '/api/ai/enrich') {
-    if (!ai.installed()) return err(res, 503, 'AI 模型尚未安装，请先点击下载');
+  if (req.method === 'POST' && p === '/api/ai/setup') {
+    let body = '';
+    req.on('data', c => body += c);
+    req.on('end', () => {
+      let b = {};
+      try { b = JSON.parse(body || '{}'); } catch (e) {}
+      // 传了 backend/tier/model 就按指定的来；什么都没传则自动挑（Ollama 优先，零下载）
+      // 注意：内置档位首次要下几个 GB，不能让 HTTP 请求一直挂着等——1.2 秒没完成就先回
+      // 当前状态（含 downloading/progress），前端继续轮询 /api/ai/status 看进度。
+      let done = false;
+      const reply = () => { if (done) return; done = true; json(res, ai.status()); };
+      ai.setup(b).then(reply).catch(e => {
+        if (done) return;
+        done = true;
+        err(res, 500, (e && e.message) ? e.message : '准备失败');
+      });
+      setTimeout(reply, 1200);
+    });
+    return;
+  }
+  // 真·AI 锐评
+  if (req.method === 'POST' && p === '/api/ai/roast') {
     let body = '';
     req.on('data', c => body += c);
     req.on('end', async () => {
@@ -1163,12 +1186,26 @@ const server = http.createServer((req, res) => {
       const d = b.d;
       if (!d || typeof d !== 'object') return err(res, 400, '缺少分析数据');
       try {
-        await ai.ensureModel(); // 自愈：已安装则懒加载到内存（重启后首次生成会多花几秒）
-        if (!ai.status().ready) return err(res, 503, 'AI 加载中，请稍后重试');
-        const r = await ai.aiAnalyze(d);
-        return json(res, r);
+        return json(res, await ai.roast(d));
       } catch (e) {
-        return err(res, 500, e && e.message ? e.message : 'AI 生成失败');
+        return err(res, 500, (e && e.message) ? e.message : 'AI 生成失败');
+      }
+    });
+    return;
+  }
+  // 情感基调 + 关系洞察
+  if (req.method === 'POST' && p === '/api/ai/enrich') {
+    let body = '';
+    req.on('data', c => body += c);
+    req.on('end', async () => {
+      let b = {};
+      try { b = JSON.parse(body || '{}'); } catch (e) {}
+      const d = b.d;
+      if (!d || typeof d !== 'object') return err(res, 400, '缺少分析数据');
+      try {
+        return json(res, await ai.aiAnalyze(d));
+      } catch (e) {
+        return err(res, 500, (e && e.message) ? e.message : 'AI 生成失败');
       }
     });
     return;

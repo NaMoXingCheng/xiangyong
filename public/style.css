@@ -172,6 +172,12 @@ body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:98;
 .roast-head{display:flex;align-items:baseline;gap:10px;margin-bottom:8px}
 .roast-tt{font-family:Georgia,serif;font-size:15px;letter-spacing:2px;color:var(--gold-hi);font-weight:700}
 .roast-sub{font-size:11px;color:#8fa8bd;letter-spacing:1px}
+.roast-ai-btn{margin-left:auto;flex:none;padding:3px 9px;border-radius:4px;font-size:11px;font-family:inherit;cursor:pointer;
+  background:rgba(var(--gold-rgb),.1);border:1px solid rgba(var(--gold-rgb),.45);color:var(--gold-hi);transition:all .16s}
+.roast-ai-btn:hover{background:rgba(var(--gold-rgb),.2);border-color:var(--gold)}
+.roast-ai-btn:disabled{opacity:.55;cursor:default}
+.roast-line.ai-made{color:var(--gold-hi);line-height:1.85}
+.roast-line.ai-caveat{margin-top:7px;padding-top:6px;border-top:1px dashed rgba(224,188,114,.28);font-size:11px;color:#8fa8bd;line-height:1.6}
 .roast-line{font-size:13px;line-height:1.7;color:#e8f2fa;letter-spacing:.4px;padding:2px 0 2px 6px}
 .roast-line + .roast-line{border-top:1px dashed rgba(var(--gold-rgb),.22);margin-top:6px;padding-top:8px}
 .roast-advice{margin-top:10px;padding:8px 10px;border:1px dashed rgba(var(--gold-rgb),.4);background:rgba(var(--gold-rgb),.06);border-radius:6px}
@@ -184,7 +190,36 @@ body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:98;
 .ai-bar:hover{border-color:var(--gold);color:var(--text)}
 .ai-bar.off{border-style:dashed}
 .ai-bar.busy{color:var(--gold-hi);border-color:var(--gold);background:rgba(var(--gold-rgb),.08)}
-.ai-bar.ok{color:var(--active);border-color:rgba(var(--accent-rgb),.6);background:rgba(var(--accent-rgb),.08);cursor:default}
+.ai-bar.ok{color:var(--active);border-color:rgba(var(--accent-rgb),.6);background:rgba(var(--accent-rgb),.08);cursor:pointer}
+.ai-bar-sub{display:block;margin-top:2px;font-size:10.5px;letter-spacing:.4px;color:#8fa8bd}
+
+/* ================= 本地 AI 模型选择面板 ================= */
+.ai-panel-mask{position:fixed;inset:0;z-index:9000;background:rgba(6,18,32,.74);display:flex;align-items:center;justify-content:center;padding:24px}
+.ai-panel{width:min(560px,100%);max-height:84vh;display:flex;flex-direction:column;background:var(--panel);
+  border:1px solid rgba(var(--gold-rgb),.35);border-radius:10px;box-shadow:0 24px 60px rgba(0,0,0,.55);overflow:hidden}
+.ai-panel-head{display:flex;align-items:center;padding:14px 16px;flex:none;border-bottom:1px solid rgba(58,106,150,.4)}
+.ai-panel-head .ap-tt{font-family:Georgia,serif;font-size:14px;letter-spacing:2px;color:var(--gold);font-weight:700}
+.ai-panel-head .ap-close{margin-left:auto;width:24px;height:24px;border-radius:4px;border:1px solid var(--line);
+  background:transparent;color:var(--muted);font-size:15px;line-height:1;cursor:pointer;transition:all .16s}
+.ai-panel-head .ap-close:hover{color:var(--gold-hi);border-color:var(--gold)}
+.ai-panel-body{padding:14px 16px 16px;overflow-y:auto;display:flex;flex-direction:column;gap:16px}
+.ap-sec-tt{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--gold-hi);letter-spacing:1px;margin-bottom:8px}
+.ap-tag{font-size:10px;padding:1px 6px;border-radius:3px;background:rgba(var(--accent-rgb),.16);
+  color:var(--cyan);border:1px solid rgba(var(--accent-rgb),.35);letter-spacing:0}
+.ap-tag.gray{background:rgba(155,184,208,.12);color:var(--muted);border-color:rgba(155,184,208,.3)}
+.ap-grid{display:flex;flex-direction:column;gap:6px}
+.ai-opt{display:flex;flex-direction:column;gap:3px;text-align:left;padding:9px 12px;border-radius:6px;cursor:pointer;
+  font-family:inherit;background:rgba(10,30,52,.5);border:1px solid rgba(58,106,150,.4);transition:all .16s}
+.ai-opt:hover{border-color:rgba(var(--accent-rgb),.7);background:rgba(var(--accent-rgb),.08)}
+.ai-opt.cur{border-color:var(--gold);background:rgba(224,188,114,.1)}
+.ai-opt.bad{opacity:.45;cursor:not-allowed}
+.ai-opt .ao-name{font-size:12.5px;color:var(--text)}
+.ai-opt .ao-name i{font-style:normal;font-size:10px;margin-left:6px;padding:1px 5px;border-radius:3px;
+  background:rgba(126,224,163,.15);color:#7ee0a3}
+.ai-opt .ao-meta{font-size:11px;color:var(--muted);line-height:1.5}
+.ai-empty{font-size:11.5px;color:var(--muted);line-height:1.7;padding:10px 12px;border-radius:6px;
+  background:rgba(10,30,52,.35);border:1px dashed rgba(58,106,150,.45)}
+.ap-foot{font-size:11px;color:var(--muted);line-height:1.7;padding-top:10px;border-top:1px dashed rgba(224,188,114,.22)}
 .ai-mood{display:flex;gap:10px;align-items:flex-start;margin-bottom:8px;padding:8px 10px;border-radius:6px;
   background:rgba(var(--accent-rgb),.07);border:1px solid rgba(var(--accent-rgb),.3)}
 .ai-mood-tt{flex:none;font-size:11px;color:var(--active);letter-spacing:1px;font-weight:600;margin-top:1px}
@@ -499,6 +534,17 @@ html,body{height:100%;overflow:hidden}
 .todo-del{margin-left:2px;width:16px;height:16px;flex:none;border:none;background:none;color:var(--muted);font-size:14px;cursor:pointer;line-height:1;opacity:0;transition:opacity .15s}
 .todo-item:hover .todo-del{opacity:1}
 .todo-del:hover{color:#ff6b6b}
+/* ---------- 已完成归档条（有已完成项时才出现） ---------- */
+.todo-archive{flex:none;display:flex;align-items:center;gap:5px;padding:5px 6px;border-radius:5px;
+  background:rgba(10,30,52,.42);border:1px dashed rgba(224,188,114,.28);
+  font-size:10.5px;line-height:1.2;color:var(--muted)}
+.todo-archive.hide{display:none}
+.todo-archive .ta-tip{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-variant-numeric:tabular-nums}
+.todo-archive .ta-btn{flex:none;padding:2px 5px;border-radius:4px;font-size:10.5px;line-height:1.4;cursor:pointer;
+  font-family:inherit;background:transparent;border:1px solid rgba(58,106,150,.6);color:var(--muted);transition:all .16s}
+.todo-archive .ta-btn:hover{color:var(--gold-hi);border-color:var(--gold)}
+.todo-archive .ta-keep.on{color:var(--gold-hi);border-color:var(--gold);background:rgba(224,188,114,.14)}
+.todo-archive .ta-clear:hover{color:#ff6b6b;border-color:rgba(255,107,107,.6)}
 .todo-roast{flex:none;border-top:1px dashed rgba(224,188,114,.3);padding-top:8px;font-size:11.5px;line-height:1.6;color:#dbe9f5}
 .todo-roast .tr-tt{display:block;font-size:10.5px;color:var(--gold-hi);letter-spacing:1px;margin-bottom:3px;font-weight:600}
 .todo-roast .tr-advice{display:block;margin-top:4px;padding-top:4px;border-top:1px dashed rgba(224,188,114,.2);color:var(--muted)}
