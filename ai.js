@@ -1,10 +1,13 @@
-// ai.js —— 本地小 AI（双后端）
+// ai.js —— 本地小 AI（内置后端）
 //
-// 后端一 ollama  ：本机已装 Ollama → 零下载，直接复用它的模型（本机首选）
-// 后端二 builtin ：内置 node-llama-cpp + GGUF，三档可选、首次下载（分发给别人走这条）
+// 一台机器上跑推理，只有「随包带上推理引擎」这一条路是可控的：
+//   内置 node-llama-cpp + GGUF，三档可选、首次下载。
+// 之前还支持「复用本机已装的 Ollama」，打包分发时那条路是纯负担 ——
+// 用户机器上多半没有 Ollama，留着它只会多一套探测/预热/卸载分支和一个永远探测失败的状态字段。
+// 现在只留内置这一条，AI_IDLE_SEC 那条「闲置归还显存」的逻辑也一条路走到底。
 //
 // 提示词全部内置在本文件（ROAST_SYSTEM 等），模型一就绪自动套用，用户不需要输入任何 prompt。
-// 全程本地，不联网上传聊天内容。
+// 全程本地，不联网上传聊天内容（只有首次下载模型时会联网）。
 
 const path = require('path');
 const fs = require('fs');
@@ -16,6 +19,13 @@ const http = require('http');
 // 主源 ModelScope（阿里，国内快），备源为另一仓库；sources 按顺序重试。
 // minVRAM 是「建议显存下限」：低于它模型会部分挤进内存，明显变慢但还能跑。
 // sizeGB 为实测文件体积（1 GB = 1024³ 字节）。
+//
+// 每条源都带 sha256，下完流式校验一遍，对不上就删掉换下一条源。
+// 它拦得住的是「传输/拼装层出的错」：分段重连时某一段写错位、被 CDN 塞了错误页、
+// 或者源地址指向了另一个文件——这些大小和 HTTP 200 都看不出来。
+// 它拦不住的是「仓库里发的那个文件本身就有毛病」：那种文件的哈希也是对的。
+// 后者只能靠选可信的转换方来规避——我们用 bartowski（llama.cpp 生态最主流、可复现的转换仓库）。
+// 这两件事要分开看，别指望哈希能兜住模型质量。
 const TIERS = [
   {
     key: 'lite', label: '轻量', params: '3B',
@@ -23,8 +33,10 @@ const TIERS = [
     sizeGB: 2.0, minVRAM: 4,
     desc: '核显 / 老笔记本也能跑，出字最快',
     sources: [
-      'https://modelscope.cn/models/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/master/qwen2.5-3b-instruct-q4_k_m.gguf',
-      'https://hf-mirror.com/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q4_k_m.gguf',
+      { url: 'https://modelscope.cn/models/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/master/qwen2.5-3b-instruct-q4_k_m.gguf',
+        sha256: '626b4a6678b86442240e33df819e00132d3ba7dddfe1cdc4fbb18e0a9615c62d' },
+      { url: 'https://modelscope.cn/models/bartowski/Qwen2.5-3B-Instruct-GGUF/resolve/master/Qwen2.5-3B-Instruct-Q4_K_M.gguf',
+        sha256: '9c9f56a391a3abbd5b89d0245bf6106081bcc3173119d4229235dd9d23253f94' },
     ],
   },
   {
@@ -33,8 +45,10 @@ const TIERS = [
     sizeGB: 4.4, minVRAM: 6,
     desc: '主流独显，锐评质量与速度平衡（推荐）',
     sources: [
-      'https://modelscope.cn/models/QuantFactory/Qwen2.5-7B-Instruct-GGUF/resolve/master/Qwen2.5-7B-Instruct.Q4_K_M.gguf',
-      'https://modelscope.cn/models/second-state/Qwen2.5-7B-Instruct-GGUF/resolve/master/Qwen2.5-7B-Instruct-Q4_K_M.gguf',
+      { url: 'https://modelscope.cn/models/bartowski/Qwen2.5-7B-Instruct-GGUF/resolve/master/Qwen2.5-7B-Instruct-Q4_K_M.gguf',
+        sha256: '65b8fcd92af6b4fefa935c625d1ac27ea29dcb6ee14589c55a8f115ceaaa1423' },
+      { url: 'https://modelscope.cn/models/second-state/Qwen2.5-7B-Instruct-GGUF/resolve/master/Qwen2.5-7B-Instruct-Q4_K_M.gguf',
+        sha256: 'a30c3c08ca3284a7b59fa35cd835ec50b4a54e211379692b0e48a34bdb72c2fb' },
     ],
   },
   {
@@ -43,13 +57,20 @@ const TIERS = [
     sizeGB: 8.4, minVRAM: 11,
     desc: '大显存专用，更懂话里的弦外之音',
     sources: [
-      'https://modelscope.cn/models/QuantFactory/Qwen2.5-14B-Instruct-GGUF/resolve/master/Qwen2.5-14B-Instruct.Q4_K_M.gguf',
-      'https://modelscope.cn/models/bartowski/Qwen2.5-14B-Instruct-GGUF/resolve/master/Qwen2.5-14B-Instruct-Q4_K_M.gguf',
+      { url: 'https://modelscope.cn/models/bartowski/Qwen2.5-14B-Instruct-GGUF/resolve/master/Qwen2.5-14B-Instruct-Q4_K_M.gguf',
+        sha256: 'e47ad95dad6ff848b431053b375adb5d39321290ea2c638682577dafca87c008' },
+      { url: 'https://modelscope.cn/models/second-state/Qwen2.5-14B-Instruct-GGUF/resolve/master/Qwen2.5-14B-Instruct-Q4_K_M.gguf',
+        sha256: '298cb13fa9435de353bb788d37f88e7efae62155ebeff6197a0f4938813ca02c' },
     ],
   },
 ];
 const DEFAULT_TIER = 'std';
 const CONTEXT_SIZE = 4096;
+
+// 显存闲置上限：多久没人用 AI，就把模型从显存里卸下来。
+// 本机 8.55 GB 显存要和游戏共存，模型挂着不动也一直占着，所以一闲就还回去。
+// 到点我们自己 dispose，下次要用再从磁盘 mmap 装回来（秒级）。
+const AI_IDLE_SEC = 120;
 
 // ==================== 二、内置提示词 ====================
 // 提示词写死在这里：模型准备好就自动生效，用户不用填、也不会每次被问。
@@ -92,226 +113,261 @@ const INSIGHT_SYSTEM = `你是中文关系观察者，能点破双方都没意�
 
 // ==================== 三、运行时状态 ====================
 const state = {
-  backend: 'none',        // 'ollama' | 'builtin' | 'none'
+  backend: 'none',        // 'builtin' | 'none'
   ready: false,           // 模型已就绪、可生成
   downloading: false,
   progress: 0,
   recvBytes: 0,           // 已下载字节（用于显示 MB 进度）
   totalBytes: 0,
+  speedBps: 0,            // 平滑后的下载速度，用来估剩余时间
+  etaSec: 0,
+  verifying: false,       // 下完了正在算 sha256
   error: null,
-  tier: DEFAULT_TIER,     // 内置模式当前档位
-  model: null,            // 当前实际使用的模型名
-  installed: false,       // 内置模式下模型文件是否已存在
-  ollamaModels: [],       // Ollama 可用模型
-  ollamaReady: false,
+  tier: DEFAULT_TIER,     // 当前档位
+  model: null,            // 当前实际使用的模型文件
+  installed: false,       // 模型文件是否已存在（且哈希对得上）
+  // ---- 显存治理 ----
+  // evicted: 模型已从显存卸下（ready 仍为 true —— 对用户来说它还是「可用」的，
+  //   只是下次调用要先装回来）。用它区分「没启用」和「用了但闲时已归还显存」。
+  evicted: false,
+  evictedAt: 0,           // 卸下时刻，前端算「闲置多久了」
+  evictReason: '',        // 'idle' | 'manual'
+  lastLoadMs: 0,          // 上次装回显存耗时，量一下才知道「要不要等」
+  lastUsedAt: 0,          // 最后一次真正跑推理的时刻
 };
 
 let modelDir = null;
 
 // 内置 llama.cpp 资源
-let llama = null, model = null, context = null;
+let llama = null, model = null;
 let loadPromise = null, setupPromise = null;
 let loadedTier = null;
+let idleTimer = null;
+
+// ==================== 显存治理：闲置到点就把模型还回去 ====================
+// 用户诉求原话是「搬到内存并压缩体积」。实测下来的结论是：
+// 权重搬进内存反而多占 4 GB 常驻，而显存该占的还是占（Vulkan 后端本身也要显存）；
+// 真正有效且无损体验的做法是「卸下 → 用时从磁盘 mmap 装回」，
+// 因为文件内容早就在 OS 页缓存里，重装是秒级的（见 status().lastLoadMs）。
+function touchIdle() {
+  state.lastUsedAt = Date.now();
+  if (idleTimer) clearTimeout(idleTimer);
+  idleTimer = setTimeout(() => { unload('idle'); }, AI_IDLE_SEC * 1000);
+  // 别让这个定时器成为进程存活的唯一理由（测试里会被它拖住）
+  if (idleTimer.unref) idleTimer.unref();
+}
+
+// 把模型从显存里清干净
+async function unload(reason) {
+  if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+  if (state.backend !== 'builtin' || !model) return false;
+  // context 是每次生成临时建的，这里要放的是 model 和 llama 后端本身
+  // —— Vulkan 后端自己就占一块显存，只 dispose model 是不够的。
+  try { await model.dispose(); } catch (e) {}
+  model = null;
+  try { if (llama) await llama.dispose(); } catch (e) {}
+  llama = null;
+  loadPromise = null;
+  loadedTier = null;
+  state.evicted = true;
+  state.evictedAt = Date.now();
+  state.evictReason = reason || 'idle';
+  return true;
+}
+
+// 闲置多少秒了（前端拿它显示「已归还显存 · 闲置 N 分钟」）
+function idleSec() {
+  if (!state.evicted) return 0;
+  return Math.round((Date.now() - state.evictedAt) / 1000);
+}
 
 // ==================== 四、工具 ====================
 function tierOf(key) { return TIERS.find(t => t.key === key) || TIERS.find(t => t.key === DEFAULT_TIER); }
 function modelPath(tier) { return path.join(modelDir, tierOf(tier).file); }
+
+// 下载完成、哈希校验通过后落一个同名 .sha256 小文件当「合格证」。
+// 之后判断「装没装」只看这个证，不用每次去重算 4.6 GB——那要十几秒。
+function stampPath(tier) { return modelPath(tier) + '.sha256'; }
+function readStamp(tier) { try { return fs.readFileSync(stampPath(tier), 'utf8').trim(); } catch (e) { return ''; } }
+
+// 流式算哈希：4~8 GB 的文件不能整个读进内存
+function sha256File(p, onTick) {
+  return new Promise((resolve, reject) => {
+    const h = require('crypto').createHash('sha256');
+    const rs = fs.createReadStream(p, { highWaterMark: 1 << 20 });
+    let bytes = 0;
+    rs.on('data', (c) => { bytes += c.length; if (onTick) onTick(bytes); h.update(c); });
+    rs.on('error', reject);
+    rs.on('end', () => resolve(h.digest('hex')));
+  });
+}
+
+// 装没装 = 模型文件在 且 有合格证 且 合格证对得上这个档位声明过的任一哈希。
+// 注意必须比「所有源的哈希」而不是只比第一条：走了备源下载时，合格证上写的是备源的哈希，
+// 只比主源就会永远判定为没装，然后每次启动都重下一遍 4.6 GB。
 function installed(tier) {
-  try { return fs.existsSync(modelPath(tier || state.tier)); } catch (e) { return false; }
+  const t = tierOf(tier || state.tier);
+  try {
+    if (!fs.existsSync(modelPath(t.key))) return false;
+    const want = t.sources.map(s => s.sha256).filter(Boolean);
+    if (!want.length) return true;              // 没声明哈希的档位：文件在就算装
+    return want.indexOf(readStamp(t.key)) >= 0;
+  } catch (e) { return false; }
 }
 function installedTiers() { return TIERS.filter(t => installed(t.key)).map(t => t.key); }
 
-function requestJSON(url, opts, timeoutMs) {
-  return new Promise((resolve, reject) => {
-    const u = new URL(url);
-    const lib = u.protocol === 'https:' ? https : http;
-    const req = lib.request({
-      hostname: u.hostname, port: u.port, path: u.pathname + u.search,
-      method: (opts && opts.method) || 'GET',
-      headers: (opts && opts.headers) || {},
-    }, (res) => {
-      let buf = '';
-      res.setEncoding('utf8');
-      res.on('data', c => buf += c);
-      res.on('end', () => {
-        if (res.statusCode < 200 || res.statusCode >= 300) {
-          return reject(new Error('HTTP ' + res.statusCode + ' ' + buf.slice(0, 200)));
-        }
-        try { resolve(JSON.parse(buf)); } catch (e) { reject(new Error('返回不是 JSON')); }
-      });
-    });
-    req.on('error', reject);
-    if (timeoutMs) req.setTimeout(timeoutMs, () => req.destroy(new Error('请求超时')));
-    if (opts && opts.body) req.write(opts.body);
-    req.end();
-  });
-}
-
-// ==================== 五、Ollama 后端 ====================
-function ollamaBase() {
-  const h = (process.env.OLLAMA_HOST || '127.0.0.1:11434').replace(/^https?:\/\//, '');
-  return 'http://' + h;
-}
-
-// 这些模型不适合做锐评：推理型会把正文写进 thinking，视觉型不是纯文本模型
-const OLLAMA_BAD = [
-  { re: /deepseek-r1|qwq|reasoning/i, why: '推理型模型，正文会被思考过程吃掉' },
-  { re: /llava|minicpm-v|vision|-vl|bakllava/i, why: '视觉模型，不是纯文本对话模型' },
-];
-// 中文锐评表现更好的系列，UI 上标「推荐」
-const OLLAMA_GOOD = /qwen|glm|gemma|yi-|internlm|baichuan|phi-4|minicpm3/i;
-
-async function detectOllama() {
-  try {
-    const j = await requestJSON(ollamaBase() + '/api/tags', null, 2500);
-    const list = (j && j.models) || [];
-    state.ollamaModels = list.map(m => {
-      const name = m.name || m.model || '';
-      const bad = OLLAMA_BAD.find(b => b.re.test(name));
-      return {
-        name,
-        sizeGB: Math.round(((m.size || 0) / 1073741824) * 10) / 10,
-        params: (m.details && m.details.parameter_size) || '',
-        quant: (m.details && m.details.quantization_level) || '',
-        usable: !bad,
-        note: bad ? bad.why : (OLLAMA_GOOD.test(name) ? '中文锐评推荐' : ''),
-      };
-    });
-    state.ollamaReady = true;
-    return state.ollamaModels;
-  } catch (e) {
-    state.ollamaReady = false;
-    state.ollamaModels = [];
-    return [];
-  }
-}
-
-// 从本机 Ollama 里挑一个适合做锐评的默认模型：中文好的系列优先，其次看体积。
-// 太大（>10GB）出词慢，太小质量不够，3–10GB 是甜点区间。
-function pickBestOllama() {
-  const usable = state.ollamaModels.filter(m => m.usable && !/cloud/i.test(m.name));
-  if (!usable.length) return null;
-  const score = (m) => {
-    let s = 0;
-    if (/qwen/i.test(m.name)) s += 100;
-    else if (/glm/i.test(m.name)) s += 90;
-    else if (/gemma|yi-|internlm|baichuan/i.test(m.name)) s += 80;
-    else s += 50;
-    const gb = m.sizeGB || 0;
-    if (gb >= 3 && gb <= 10) s += 50;
-    else if (gb > 10) s -= 40;
-    else if (gb > 0) s += 10;
-    return s;
-  };
-  return usable.slice().sort((a, b) => score(b) - score(a))[0];
-}
-
-// 预热：发一个极短请求把模型加载进显存，免得用户第一次点锐评干等二十秒
-async function warmup() {
-  if (state.backend !== 'ollama' || !state.model) return;
-  try {
-    const body = JSON.stringify({
-      model: state.model,
-      stream: false,
-      think: false,
-      messages: [{ role: 'user', content: '你好' }],
-      options: { num_predict: 1, num_ctx: 512 },
-      keep_alive: '15m',
-    });
-    await requestJSON(ollamaBase() + '/api/chat', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
-      body,
-    }, 300000);
-  } catch (e) { /* 预热失败不影响主流程 */ }
-}
-
-// 给 Ollama 发一次对话请求。think:false 关掉思考过程（对不支持该参数的模型无害）
-async function ollamaChat(modelName, system, user, maxTokens, temperature) {
-  const body = JSON.stringify({
-    model: modelName,
-    stream: false,
-    think: false,
-    keep_alive: '15m',
-    messages: [
-      { role: 'system', content: system },
-      { role: 'user', content: user },
-    ],
-    options: { temperature: temperature || 0.8, top_p: 0.9, num_ctx: CONTEXT_SIZE, num_predict: maxTokens || 400 },
-  });
-  const j = await requestJSON(ollamaBase() + '/api/chat', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
-    body,
-  }, 180000);
-  const msg = (j && j.message) || {};
-  const text = (msg.content || '').trim();
-  if (!text && msg.thinking) {
-    throw new Error('这个模型把正文写进了思考过程（推理型模型），换一个对话模型试试，比如 qwen 或 glm 系列');
-  }
-  return text;
-}
-
-// ==================== 六、内置 llama.cpp 后端 ====================
-// 支持断点续传：中断后重来会从 .part 的已有大小接着下（14B 有 8.4 GB，重头下太伤）。
+// ==================== 五、内置 llama.cpp 后端 ====================
+// 大文件下载（2~8.4 GB）。三条保命机制：
+//   1) 断点续传：一切从 .part 的当前大小接着下
+//   2) 分段重连：换新连接来摆脱劣化的老连接（长时间单连接实测会掉到 0.2 MB/s）
+//   3) 卡死自愈：超过 STALL_MS 没有新数据就断掉重连，而不是傻等
+// 这三条都是为了「没人看着的时候也能自己下完」。
+//
+// 换连接的判据有两条，缺一不可：
+//   - 下满 SEGMENT：兜底，防止连接一直不温不火地拖着
+//   - 跑够 WARMUP_MS 后平均速度仍低于 MIN_BPS：这才是真正救「还活着但掉速」的那种连接，
+//     光靠 STALL_MS 拦不住它——那种连接一直在滴数据，永远不会触发「没数据」判定。
+// SEGMENT 定 64MB 是实测值：这个设置能跑到 5.7 MB/s，和同网络下 curl 单连接（5.2 MB/s）
+// 一致，说明已经顶到源站/网络的上限了。曾怀疑「换太勤会反复吃 TCP 慢启动」，实测不成立，
+// 别把段调大——段越大，遇到劣化连接的恢复越慢。
 function downloadFile(url, dest, onProgress) {
-  return new Promise((resolve, reject) => {
-    const tmp = dest + '.part';
-    let redirects = 0;
-    let resumeFrom = 0;
-    try { resumeFrom = fs.statSync(tmp).size; } catch (e) { resumeFrom = 0; }
+  const tmp = dest + '.part';
+  const SEGMENT = 64 * 1024 * 1024;   // 每 64 MB 换一次连接（实测已顶到网络上限）
+  const STALL_MS = 20000;             // 20 秒没有新数据 = 这条连接废了
+  const MIN_BPS = 1024 * 1024;        // 段平均速度低于 1 MB/s 也判为劣化
+  const WARMUP_MS = 45000;            // 给新连接 45 秒的爬坡期再判速度
+  const MAX_STALLS = 5;               // 连续 5 次「重连后一点没下动」才判失败
 
-    const attempt = (u, from) => {
-      const lib = u.startsWith('https') ? https : http;
-      const headers = { 'User-Agent': 'xiangyong-app/0.4' };
-      if (from > 0) headers['Range'] = 'bytes=' + from + '-';
-      const req = lib.get(u, { headers }, (res) => {
-        // 跟随重定向（ModelScope 会 302 到 OSS）
-        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-          res.resume();
-          if (++redirects > 8) return reject(new Error('重定向次数过多'));
-          return attempt(new URL(res.headers.location, u).toString(), from);
-        }
-        // 416 = 请求的区间超出文件长度，说明本地已下完
-        if (res.statusCode === 416) {
-          res.resume();
-          try { fs.renameSync(tmp, dest); return resolve(); }
-          catch (e) { return reject(e); }
-        }
-        if (res.statusCode !== 200 && res.statusCode !== 206) {
-          res.resume();
-          return reject(new Error('HTTP ' + res.statusCode));
-        }
-        const partial = res.statusCode === 206;
-        const base = partial ? from : 0;                 // 服务端不支持 Range 时从头写
-        const len = parseInt(res.headers['content-length'] || '0', 10);
-        const total = len ? len + base : 0;
-        let received = base;
-        const ws = fs.createWriteStream(tmp, { flags: base > 0 ? 'a' : 'w' });
-        res.on('data', (c) => {
-          received += c.length;
-          if (onProgress) onProgress(received, total);
-        });
-        res.pipe(ws);
-        ws.on('finish', () => {
-          ws.close(() => {
-            if (total && received < total) return reject(new Error('连接中断，已下载 ' + received + '/' + total));
-            try { fs.renameSync(tmp, dest); resolve(); } catch (e) { reject(e); }
-          });
-        });
-        ws.on('error', reject);
-      });
-      req.on('error', reject);
-      req.setTimeout(60000, () => req.destroy(new Error('下载超时')));
+  return new Promise((resolve, reject) => {
+    let stallRounds = 0;
+    let finished = false;
+
+    const fileSize = () => { try { return fs.statSync(tmp).size; } catch (e) { return 0; } };
+
+    const done = () => {
+      if (finished) return;
+      finished = true;
+      try { fs.renameSync(tmp, dest); resolve(); }
+      catch (e) { reject(e); }
     };
-    attempt(url, resumeFrom);
+
+    // 一段下完（正常结束 / 下满 SEGMENT / 卡死）→ 记录进度并决定下一步
+    // 注意：下一段的起点一律重新读 .part 的真实大小，不信任内存里的计数——
+    // 缓冲区没落盘时它会偏大，读磁盘最保险。
+    const advance = (sawProgress, total) => {
+      const have = fileSize();
+      if (total && have >= total) return done();
+      if (!sawProgress) {
+        if (++stallRounds >= MAX_STALLS) {
+          return reject(new Error('连接反复卡住，已下载 ' + Math.round(have / 1048576) + ' MB，再点一次可以接着下'));
+        }
+      } else {
+        stallRounds = 0;
+      }
+      setTimeout(() => step(), 300);   // 稍等一下再重连，别把服务端打急
+    };
+
+    const step = () => {
+      const from = fileSize();
+      let sawProgress = false;
+      // 重定向计数必须按「段」重置：ModelScope 每次请求都会 302 到 OSS，
+      // 放在外层会随着分段重连一路累加，下到一半就误报「重定向次数过多」。
+      let redirects = 0;
+
+      const go = (u, off) => {
+        const lib = u.startsWith('https') ? https : http;
+        const headers = { 'User-Agent': 'xiangyong-app/0.4' };
+        if (off > 0) headers['Range'] = 'bytes=' + off + '-';
+
+        let settled = false;
+        let ws = null, timer = null, resRef = null;
+        let received = off, total = 0, lastData = Date.now(), segBytes = 0;
+        const segStart = Date.now();   // 这条连接的起始时刻，用来算段平均速度
+
+        // 结束这一段：先把写流 flush 干净，再决定是否重连
+        const cut = () => {
+          if (settled) return;
+          settled = true;
+          if (timer) clearInterval(timer);
+          const after = () => {
+            try { if (resRef) resRef.destroy(); } catch (e) {}
+            advance(sawProgress, total);
+          };
+          if (ws) { try { ws.end(after); } catch (e) { after(); } } else after();
+        };
+
+        const req = lib.get(u, { headers }, (res) => {
+          resRef = res;
+          // 跟随重定向（ModelScope 会 302 到 OSS）
+          if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+            res.resume();
+            settled = true;
+            if (++redirects > 8) return reject(new Error('重定向次数过多'));
+            return go(new URL(res.headers.location, u).toString(), off);
+          }
+          // 416 = 请求区间超出文件长度，说明本地已经下完
+          if (res.statusCode === 416) { res.resume(); settled = true; return done(); }
+          if (res.statusCode !== 200 && res.statusCode !== 206) {
+            res.resume();
+            // 4xx 是地址本身的问题（换源才有用），交给上层抛错；5xx/429 是暂时性的，当卡住重试
+            const code = res.statusCode;
+            if (code === 404 || code === 403 || code === 401) {
+              settled = true;
+              return reject(new Error('HTTP ' + code));
+            }
+            return cut();
+          }
+
+          const base = res.statusCode === 206 ? off : 0;   // 服务端不认 Range 就从头写
+          const len = parseInt(res.headers['content-length'] || '0', 10);
+          total = len ? len + base : 0;
+          received = base;
+          if (onProgress) onProgress(received, total);
+
+          ws = fs.createWriteStream(tmp, { flags: base > 0 ? 'a' : 'w' });
+          timer = setInterval(() => {
+            const now = Date.now();
+            if (now - lastData > STALL_MS) return cut();          // 彻底不动了
+            // 还活着但爬得太慢：跑过爬坡期后段平均速度仍不达标 → 换连接
+            const el = now - segStart;
+            if (el >= WARMUP_MS && segBytes / (el / 1000) < MIN_BPS) cut();
+          }, 3000);
+
+          res.on('data', (c) => {
+            if (settled) return;
+            received += c.length;
+            segBytes += c.length;
+            lastData = Date.now();
+            sawProgress = true;
+            if (onProgress) onProgress(received, total);
+            if (segBytes >= SEGMENT) cut();              // 下满一段就换连接
+          });
+          res.on('end', cut);
+          res.on('error', cut);
+          ws.on('error', (e) => {
+            if (settled) return;
+            settled = true;
+            if (timer) clearInterval(timer);
+            reject(e);
+          });
+          res.pipe(ws);
+        });
+
+        req.on('error', cut);
+      };
+
+      go(url, from);
+    };
+
+    step();
   });
 }
 
 // 让出错信息带上「可续传」的提示
 function friendlyDownloadError(e) {
   const m = (e && e.message) || '未知错误';
-  if (/中断|超时|ECONNRESET|socket hang up|ETIMEDOUT/i.test(m)) {
+  if (/哈希|校验|换源/.test(m)) return m;
+  if (/中断|超时|卡住|ECONNRESET|socket hang up|ETIMEDOUT/i.test(m)) {
     return '下载中断（' + m + '）。已下载的部分保留着，再点一次会接着下。';
   }
   return '下载失败：' + m;
@@ -320,21 +376,70 @@ function friendlyDownloadError(e) {
 async function downloadTier(tierKey, onProgress) {
   const t = tierOf(tierKey);
   const dest = modelPath(t.key);
-  if (fs.existsSync(dest)) return dest;
+  if (installed(t.key)) return dest;
+
+  // 文件在、但没有合格证（老版本装下来的，或者下到一半留下的半成品）。
+  // 先就地算一遍哈希：对得上就直接补发合格证，不用重下 4.6 GB；
+  // 对不上说明是坏文件，删掉——留着它会挡住续传逻辑，永远修不好。
+  const declared = t.sources.map(s => s.sha256).filter(Boolean);
+  if (fs.existsSync(dest) && declared.length) {
+    try {
+      state.verifying = true;
+      const got = await sha256File(dest);
+      state.verifying = false;
+      if (declared.indexOf(got) >= 0) { fs.writeFileSync(stampPath(t.key), got); return dest; }
+      fs.unlinkSync(dest);
+    } catch (e) {
+      state.verifying = false;
+      try { fs.unlinkSync(dest); } catch (e2) {}
+    }
+  } else if (fs.existsSync(dest) && !declared.length) {
+    return dest;
+  }
+
   let lastErr = null;
-  for (const url of t.sources) {
-    try { await downloadFile(url, dest, onProgress); return dest; }
-    catch (e) { lastErr = e; }
+  for (let i = 0; i < t.sources.length; i++) {
+    const src = t.sources[i];
+    const url = src.url;
+    try {
+      await downloadFile(url, dest, onProgress);
+    } catch (e) { lastErr = e; continue; }
+
+    // 下完了不等于下对了：流式算一遍 sha256 才认。
+    // 实测 4.4 GB 约 4 秒，前端显示「校验中…」就够，不会让人以为卡死。
+    if (src.sha256) {
+      try {
+        if (state) state.verifying = true;
+        const got = await sha256File(dest);
+        state.verifying = false;
+        if (got !== src.sha256) {
+          // 内容对不上 → 删掉重来，换下一条源。
+          // 不删的话 .part 续传逻辑会以为「已经下完了」，永远卡在坏文件上。
+          try { fs.unlinkSync(dest); } catch (e) {}
+          lastErr = new Error('文件校验失败（源 ' + (i + 1) + ' 的文件本身有问题），已自动换源重下');
+          continue;
+        }
+        fs.writeFileSync(stampPath(t.key), src.sha256);
+      } catch (e) {
+        state.verifying = false;
+        lastErr = e; continue;
+      }
+    }
+    try { fs.unlinkSync(dest + '.part'); } catch (e) {}
+    return dest;
   }
   throw new Error(friendlyDownloadError(lastErr));
 }
 
 async function loadBuiltin(tierKey) {
   const t = tierOf(tierKey);
-  if (state.ready && loadedTier === t.key && state.backend === 'builtin') return;
+  // model 必须真的在手上才算「已加载」——空闲卸下之后 ready 仍是 true，
+  // 只认 ready 会让 chat() 拿着空 model 直接崩。
+  if (state.ready && loadedTier === t.key && state.backend === 'builtin' && model) return;
   if (loadPromise && loadedTier === t.key) return loadPromise;
   loadedTier = t.key;
   loadPromise = (async () => {
+    const t0 = Date.now();
     const { getLlama } = await import('node-llama-cpp');
     // GPU 选择顺序：Vulkan 优先（一个 95MB 的包就通吃 NVIDIA / AMD / Intel，不需要用户装 CUDA 工具链），
     // 不行再交给 auto，最后退回 CPU。注意别让 auto 去试 CUDA——那会触发 cmake 现场编译，包给用户必然失败。
@@ -344,30 +449,34 @@ async function loadBuiltin(tierKey) {
       try { llama = await getLlama({ gpu: 'auto' }); }
       catch (e2) { llama = await getLlama({ gpu: false }); }
     }
-    if (model) { try { await model.dispose(); } catch (e) {} model = null; context = null; }
+    if (model) { try { await model.dispose(); } catch (e) {} model = null; }
     model = await llama.loadModel({ modelPath: modelPath(t.key) });
-    context = await model.createContext({ contextSize: CONTEXT_SIZE });
     // 后端/模型名在这里一起落定：以「真正加载成功的东西」为准，避免并发时状态错位
     state.backend = 'builtin';
     state.ready = true;
     state.model = t.file;
+    state.evicted = false;
+    state.lastLoadMs = Date.now() - t0;
   })();
   return loadPromise;
 }
 
 async function builtinChat(system, user, maxTokens, temperature) {
   const { LlamaChatSession } = await import('node-llama-cpp');
-  const session = new LlamaChatSession({
-    contextSequence: context.getSequence(),
-    systemPrompt: system,
-    autoDisposeSequence: true,
-  });
+  // 每次生成开一个独立 context，用完即弃。
+  // 不要共用 context 再手动回收序列——只要有一次生成中途异常，序列就漏在那里，
+  // 之后所有请求都会以「No sequences left」失败。独立 context 没有这个隐患。
+  const ctx = await model.createContext({ contextSize: CONTEXT_SIZE });
   try {
+    const session = new LlamaChatSession({
+      contextSequence: ctx.getSequence(),
+      systemPrompt: system,
+    });
     return (await session.prompt(user, {
       maxTokens: maxTokens || 400, temperature: temperature || 0.8, topP: 0.9,
     })).trim();
   } finally {
-    session.dispose({ disposeSequence: true });
+    try { await ctx.dispose(); } catch (e) {}
   }
 }
 
@@ -376,7 +485,6 @@ function init(dir) {
   modelDir = path.join(dir, 'models');
   fs.mkdirSync(modelDir, { recursive: true });
   state.installed = installed(state.tier);
-  detectOllama(); // 异步探测，结果写回 state
 }
 
 function status() {
@@ -384,9 +492,12 @@ function status() {
     backend: state.backend,
     ready: state.ready,
     downloading: state.downloading,
+    verifying: state.verifying,
     progress: Math.round(state.progress * 100),
     downloadedMB: Math.round((state.recvBytes || 0) / 1048576),
     totalMB: Math.round((state.totalBytes || 0) / 1048576),
+    speedMBps: state.downloading ? Math.round((state.speedBps || 0) / 104857.6) / 10 : 0,
+    etaSec: state.downloading ? (state.etaSec || 0) : 0,
     installed: state.installed,
     error: state.error,
     tier: state.tier,
@@ -396,54 +507,28 @@ function status() {
       minVRAM: t.minVRAM, desc: t.desc, installed: installed(t.key),
     })),
     installedTiers: installedTiers(),
-    ollamaReady: state.ollamaReady,
-    ollamaModels: state.ollamaModels,
+    // ---- 显存治理：前端据此显示「已归还显存 · 闲置 N 分钟，下次调用自动装回」----
+    idleLimit: AI_IDLE_SEC,
+    idleSec: idleSec(),
+    evicted: state.evicted,
+    evictReason: state.evictReason,
+    lastLoadMs: state.lastLoadMs,
+    // 显存当下到底占没占：没启用 = free，启用且没卸下 = held，卸下了 = released
+    vram: !state.ready ? 'free' : (state.evicted ? 'released' : 'held'),
   };
 }
 
-// 准备模型：优先挑本机 Ollama，其次用内置档位下载
+// 准备模型：选定档位 → 必要时下载 → 载入显存
 async function setup(opts) {
   const o = opts || {};
   state.error = null;
   if (o.tier) state.tier = tierOf(o.tier).key;
 
-  // 明确指定 Ollama
-  if (o.backend === 'ollama' || o.model) {
-    if (!state.ollamaReady) await detectOllama();
-    if (state.ollamaReady) {
-      let name = o.model;
-      if (!name) {
-        const best = pickBestOllama();
-        name = best && best.name;
-      }
-      if (!name) { state.error = 'Ollama 里没有可用的对话模型'; return status(); }
-      state.backend = 'ollama';
-      state.model = name;
-      state.ready = true;
-      warmup(); // 后台预热，用户第一次点锐评就不用干等
-      return status();
-    }
-    if (o.backend === 'ollama') { state.error = '没有检测到 Ollama 服务'; return status(); }
-  }
-
-  // 没指定后端：先看 Ollama 在不在，在就直接用（零下载）
-  if (!o.backend) {
-    if (!state.ollamaReady) await detectOllama();
-    if (state.ollamaReady) {
-      const best = pickBestOllama();
-      if (best) {
-        state.backend = 'ollama';
-        state.model = best.name;
-        state.ready = true;
-        warmup();
-        return status();
-      }
-    }
-  }
-
-  // 内置模式
   state.backend = 'builtin';
   if (setupPromise && loadedTier === state.tier) return setupPromise;
+  // 换档位时先把 ready 放下——旧模型还在显存里，
+  // 但它不是用户现在要用的那个，留着 ready=true 会让界面谎报「已就绪」。
+  if (loadedTier !== state.tier) state.ready = false;
   setupPromise = (async () => {
     try {
       state.downloading = true;
@@ -451,10 +536,24 @@ async function setup(opts) {
       state.recvBytes = 0;
       state.totalBytes = 0;
       if (!installed(state.tier)) {
+        // 大文件要下十几分钟，得让用户看见速度和剩余时间，不然像卡死了
+        let lastT = 0, lastB = 0;
+        state.speedBps = 0;
+        state.etaSec = 0;
         await downloadTier(state.tier, (recv, total) => {
           state.recvBytes = recv;
           state.totalBytes = total;
           state.progress = total ? recv / total : 0;
+          const now = Date.now();
+          // 第一个回调只当基线：续传时起点不是 0，直接算会得出一个虚高的速度
+          if (!lastT) { lastT = now; lastB = recv; return; }
+          if (now - lastT >= 1000) {
+            const inst = (recv - lastB) / ((now - lastT) / 1000);
+            // 指数平滑，避免速度数字疯狂跳动
+            state.speedBps = state.speedBps > 0 ? Math.round(state.speedBps * 0.6 + inst * 0.4) : Math.round(inst);
+            lastT = now; lastB = recv;
+            state.etaSec = (state.speedBps > 0 && total > recv) ? Math.round((total - recv) / state.speedBps) : 0;
+          }
         });
       }
       state.progress = 1;
@@ -462,12 +561,15 @@ async function setup(opts) {
       state.installed = true;
       state.model = tierOf(state.tier).file;
       state.ready = true;
+      touchIdle();
     } catch (e) {
       state.error = (e && e.message) ? e.message : String(e);
       state.ready = false;
       setupPromise = null;   // 允许用户再点一次重试（已下载的部分会续传）
     } finally {
       state.downloading = false;
+      // 兜底复位：万一校验中途抛了奇怪的异常，界面不能永远停在「校验中…」
+      state.verifying = false;
     }
     return status();
   })();
@@ -477,21 +579,20 @@ async function setup(opts) {
 // 兼容旧调用
 async function ensureModel() {
   if (state.ready) return status();
-  // 已有一次「准备」在进行中（典型是内置模型正在下载/加载），等它，不要再发起一次——
-  // 否则会自动挑 Ollama 并把下载好的内置模型状态冲掉。
+  // 已有一次「准备」在进行中（模型正在下载/加载），等它，不要再发起一次——
+  // 并发起第二次会把第一次的进度状态冲掉。
   if (setupPromise) return setupPromise;
   return setup({});
 }
 
-// 统一生成：自动走当前后端
+// 统一生成
 async function chat(system, user, maxTokens, temperature) {
-  if (state.backend === 'ollama') {
-    if (!state.ollamaReady) await detectOllama();
-    if (!state.ollamaReady) throw new Error('Ollama 服务不可用，请先启动 Ollama');
-    return ollamaChat(state.model, system, user, maxTokens, temperature);
-  }
   if (!state.ready) await ensureModel();
-  if (!state.ready) throw new Error(state.error || '模型未就绪');
+  // 空闲把模型卸下过 —— 这里就是「下次激活再搬回显存」那一步。
+  // 文件内容还在 OS 页缓存里，实测是秒级（status().lastLoadMs 会告诉用户实际花了多久）。
+  if (state.ready && state.evicted) await loadBuiltin(state.tier);
+  if (!state.ready || !model) throw new Error(state.error || '模型未就绪');
+  touchIdle();
   return builtinChat(system, user, maxTokens, temperature);
 }
 
@@ -545,6 +646,19 @@ function hasNumber(text, n) {
 }
 function citedNumbers(text, nums) {
   return nums.filter(n => hasNumber(text, n));
+}
+// 正文里「像统计量」的多位数。年份不算 —— 模型写「2025 年」很正常，
+// 而 buildSummary 里并不含年份，拿它当编造会天天误报。
+function statedNumbers(text) {
+  return (String(text || '').match(/\d+(?:\.\d+)?/g) || [])
+    .filter(n => !/^(?:19|20)\d{2}$/.test(n.replace(/\.\d+$/, '')));
+}
+// 反向校验：不是「有没有引用数字」，而是「有没有编造数字」。
+// 寄语、结语这类创作性文本，数字本来就是可选的（BLESSING_SYSTEM 铁律 1 写的是「可以引用…最多两个」），
+// 用「至少引用一个」当判据会把一段合格的祝福判成不合格。这里只抓真问题：说了统计里没有的数。
+function noFabricatedNumbers(text, summary) {
+  const said = statedNumbers(text);
+  return said.every(n => hasNumber(summary, n) || numbersIn(summary).includes(n));
 }
 
 // ---- 主接口一：AI 锐评（原本被模板顶替、现在真正接上模型的那块）----
@@ -605,6 +719,174 @@ async function aiAnalyze(d) {
   };
 }
 
+// ---- 主接口三：热词榜话题归纳 ----
+// 规则选出来的候选词能给「哪些词热」，但给不了「这俩人在聊什么」。
+// 让模型把候选词归成几个话题；候选词表一并传回去做白名单，模型编的词一律不收。
+const TOPIC_SYSTEM = `你是一个中文聊天话题归纳器。用户会给你一批从两个人的聊天记录里统计出来的高频词组（带出现次数）。
+
+【任务】
+把它们归纳成 4 到 6 个「话题」，每个话题起一个 4 到 10 个字的中文标签，并把属于这个标签的词组列出来。
+
+【铁律】
+1. 只能使用用户给你的词组，一个都不许自己编
+2. 每个词组只能归到一个话题里，不要重复出现
+3. 标签要具体、像人话，例如「约饭和吃啥」「周末出去玩」「深夜emo」，不要「日常交流」这种放在哪都成立的废话
+4. 归纳不出来就别硬凑，宁可只给 3 个话题
+
+【输出格式】
+每个话题单独一行，标签和词组之间用竖线隔开，词组之间用顿号隔开。不要写任何多余的字、不要编号、不要解释。
+例如：
+约饭和吃啥|火锅、烧烤、吃啥、外卖`;
+
+// 「标签|内容」这种一行一条的格式，模型最容易照做，也最容易解析。
+// 三个能力（话题归纳 / 待办锐评）都用它，所以只在这里拆一次。
+function parsePairs(text, max) {
+  const out = [];
+  for (const line of String(text || '').split(/\r?\n/)) {
+    const s = line.replace(LEAD_NOISE, '').trim();
+    const m = /^([^|｜]{1,16})\s*[|｜]\s*(.+)$/.exec(s);
+    if (m) out.push({ k: m[1].trim(), v: m[2].trim() });
+    if (max && out.length >= max) break;
+  }
+  return out;
+}
+
+async function topics(pname, cands) {
+  if (!state.ready) await ensureModel();
+  if (!state.ready) throw new Error(state.error || 'AI 未就绪');
+  const list = cands.map(c => `${c.w}(${c.n}次)`).join('、');
+  const ask = `联系人叫「${pname}」。以下是高频词组：\n${list}\n\n请按格式归纳成 4 到 6 个话题。`;
+
+  const parse = (t) => {
+    const allow = new Set(cands.map(c => c.w));
+    const out = [];
+    for (const p of parsePairs(t, 6)) {
+      // 只留确实在候选表里的词，模型自己发挥出来的直接丢掉
+      const words = p.v.split(/[、,，\/\s]+/).map(x => x.trim()).filter(w => w && allow.has(w));
+      if (words.length) out.push({ label: p.k, words: words.slice(0, 8) });
+    }
+    return out;
+  };
+
+  let text = await chat(TOPIC_SYSTEM, ask, 520, 0.35);
+  let out = parse(text);
+  // 一行都没解析出来，多半是格式跑偏了，再要一次（只重试一次，不无限等）
+  if (!out.length) {
+    text = await chat(TOPIC_SYSTEM, ask + '\n\n注意：必须严格用「标签|词、词」的格式，一行一个话题。', 520, 0.2);
+    out = parse(text);
+  }
+  return { ok: true, topics: out, backend: state.backend, model: state.model };
+}
+
+// ==================== 四、三个「一次生成」能力 ====================
+// 狗头军师建议 / 待办锐评 / 报告结尾寄语，流程完全一样：
+// 就绪 → 调模型 → 清理 → 兜底解析。差别只在提示词和怎么收尾，
+// 所以用一个极小的工厂收口，而不是把 chat() 那几行抄三遍。
+
+const ADVICE_SYSTEM = `你是一个中文关系军师，外号「狗头军师」——给的建议要反套路、能落地、带点损友的机灵劲儿。
+
+【铁律】
+1. 只写一条建议，60 到 120 字，不要分点、不要编号、不要标题
+2. 必须落在「下一件具体能做的事」上，例如「周四晚上发一条不带问题的分享」
+3. 禁止「多沟通」「多理解」「用心经营」这类放到哪都对、其实什么都没说的话
+4. 你只有统计数据，没有聊天原文，不许编造人名、事件、聊天内容
+5. 不涉及性、身体、外貌；不用贬低人的词；毒舌的落点是让人看得更清楚，不是让人难受
+6. 分清「我」和「TA」是两个人，别把主动方说反
+7. 直接输出建议正文，不要「建议：」这样的前缀`;
+
+const TODO_SYSTEM = `你是一个中文效率伙伴，帮人看自己的待办清单执行情况，语气毒舌但友好、接地气。
+
+【任务】
+根据用户给的待办清单（已完成 / 未完成），写一句锐评（35 到 70 字）和一条建议（30 到 70 字）。
+
+【铁律】
+1. 锐评要引用真实数字（总数 / 已完成 / 未完成），不许编数字
+2. 建议要具体到「先做哪一件事」，可以直接点名清单里的某一条
+3. 不许写成「加油你可以的」这类空话；也不许羞辱当事人
+4. 严格按下面的格式输出两行，不要多余的字、不要编号、不要解释
+
+【输出格式】
+锐评|这里是锐评
+建议|这里是建议`;
+
+const BLESSING_SYSTEM = `你在为一段关系写年度报告的结尾寄语。这份报告是根据两个人一整年的聊天记录生成的。
+
+【风格】
+- 温暖、克制、有分量，像一封不长的信的最后一段
+- 有文学感但不堆砌辞藻，不用「亲爱的」这种称呼
+- 中文，2 到 4 句，总共 45 到 110 字
+
+【铁律】
+1. 可以引用给你的真实数字（消息数 / 天数 / 次数），但最多引用两个，不要报菜名
+2. 不许编造具体事件、人名、聊天内容——你只有统计数据
+3. 不劝分不劝和，不做道德判断；落点是祝福与鼓励，不是评判
+4. 不涉及性、身体、外貌；不用贬低人的词
+5. 分清「我」和「TA」，别把谁更主动说反
+6. 直接输出寄语正文，不要标题、不要致辞格式、不要引号包裹`;
+
+function oneShot(system, makeAsk, maxTokens, temperature, finish) {
+  return async (arg) => {
+    if (!state.ready) await ensureModel();
+    if (!state.ready) throw new Error(state.error || 'AI 未就绪');
+    const text = await chat(system, makeAsk(arg), maxTokens, temperature);
+    return finish(text, arg);
+  };
+}
+
+// 狗头军师：把模板建议换成模型按真实数据现写的
+const advice = oneShot(ADVICE_SYSTEM,
+  (d) => `聊天统计：${buildSummary(d)}\n请按上面的要求给一条相处建议。`,
+  260, 0.85,
+  (text, d) => {
+    const s = buildSummary(d);
+    // 判据同 blessing：ADVICE_SYSTEM 从没要求报数字（它给的范例就不含数字），
+    // 所以这里只抓「编造了统计里没有的数」，不拿「没引用数字」当罪。
+    const cited = citedNumbers(text, numbersIn(s).filter(n => n.length >= 2));
+    return { ok: true, advice: stripLead(text), grounded: noFabricatedNumbers(text, s), cited: cited.slice(0, 6), backend: state.backend, model: state.model };
+  });
+
+// 待办锐评：输入是用户自己的清单（本地模型跑，不外传）
+const todoRoast = oneShot(TODO_SYSTEM,
+  (t) => {
+    const list = (t.todos || []).slice(0, 20);
+    const done = list.filter(x => x.done).length;
+    const open = list.filter(x => !x.done);
+    const lines = list.map(x => (x.done ? '✔ ' : '· ') + String(x.text || '').slice(0, 40)).join('\n');
+    return `一共 ${list.length} 条待办，已完成 ${done} 条，未完成 ${open.length} 条。\n清单：\n${lines}\n\n请按格式给一句锐评和一条建议。`;
+  },
+  220, 0.85,
+  (text, t) => {
+    const pairs = parsePairs(text, 3);
+    const get = (k) => (pairs.find(p => p.k.indexOf(k) >= 0) || {}).v || '';
+    let body = get('锐评'), tip = get('建议');
+    // 模型没按格式走时退回「取前两行」——总比给用户一片空白强
+    if (!body) {
+      const ls = toLines(text);
+      body = ls[0] || '';
+      tip = tip || ls[1] || '';
+    }
+    if (!body) throw new Error('模型这次没写出内容，再点一次试试');
+    const nums = numbersIn(`一共 ${(t.todos || []).length} 条`);
+    return { ok: true, body, advice: tip, grounded: citedNumbers(body, nums).length > 0, backend: state.backend, model: state.model };
+  });
+
+// 报告结尾寄语：模板兜底在前端，这里给出模型版本
+const blessing = oneShot(BLESSING_SYSTEM,
+  // 字数要求必须在这儿再说一遍。BLESSING_SYSTEM 里写着「2 到 4 句、45 到 110 字」，
+  // 但 3B 这种小模型对远在 system 里的格式约束遵守得很差 —— 实测只写出 28 字就收尾，
+  // 年度报告最后一页看着很单薄。roast 那边当初就是靠这招压住字数的，这里照做。
+  (d) => `聊天统计：${buildSummary(d)}\n请写这段年度报告的结尾寄语。3 到 4 句话，总共 60 到 100 字，不要一两句就结束。`,
+  300, 0.9,
+  (text, d) => {
+    const s = buildSummary(d);
+    const clean = noFabricatedNumbers(text, s);
+    return { ok: true, blessing: stripLead(text), grounded: clean, backend: state.backend, model: state.model };
+  });
+
 module.exports = {
-  init, status, ensureModel, setup, detectOllama, roast, aiAnalyze, chat, installed, TIERS,
+  init, status, ensureModel, setup, chat, installed, TIERS,
+  roast, aiAnalyze, topics, advice, todoRoast, blessing,
+  // 给测试用：防编造数字的反向校验
+  _noFabricatedNumbers: noFabricatedNumbers,
+  unload, idleSec, AI_IDLE_SEC,
 };

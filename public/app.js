@@ -25,6 +25,17 @@
       return _f(url, opts).then(res => { if (res.status === 401) _taShowLogin(); return res; });
     };
   })();
+
+  // 缩略图加载失败就把节点摘掉。用全局捕获监听代替内联 onerror="..."，
+  // 一是为了能开严格的 CSP（内联事件处理器会被 script-src 'self' 拦掉），
+  // 二是不用给每次 render 的 innerHTML 都挂一遍。
+  // 说明：缩略图没缓存时服务端会回一张透明占位图，正常走不到这里；
+  // 真正会失败的是网络中断 / 缓存被清那类情况，兜一下免得留一个破图图标。
+  document.addEventListener('error', function (e) {
+    const t = e.target;
+    if (t && t.tagName === 'IMG' && t.classList.contains('tl-img')) t.remove();
+  }, true);
+
   function _taShowLogin() {
     if (document.getElementById('ta-login')) return;
     const ov = document.createElement('div');
@@ -53,6 +64,29 @@
   }
 
   // ---------- Toast（替代关键操作 alert） ----------
+  // ---------- 音效 ----------
+  // 统一从这一处发声。sound.js 没加载成功 / 用户关了声音 / 音频上下文还没被
+  // 用户手势唤醒 —— 三种情况都必须静默收场，绝不能因为放个音效把功能搞挂。
+  const sfx = (n) => { try { if (window.SOUND) window.SOUND.sfx(n); } catch (e) {} };
+
+  // 通用点击音：可点的东西点一下就有回应。
+  // 挂在**冒泡**阶段（document 上最后跑），这样：
+  //   - 具体交互可以先把自己的声音放掉，再设 e.__sfx 把通用 tap 拦掉，不会两声叠一起
+  //   - 元素上写 data-sfx="page" 可以换一个音；写 "none" 则完全不出声
+  const CLICKABLE = 'button, [role="button"], .person, .chip, .tl-item, .gd-card';
+  document.addEventListener('click', (e) => {
+    if (e.__sfx) return;
+    const el = e.target && e.target.closest ? e.target.closest(CLICKABLE) : null;
+    if (!el || el.disabled) return;
+    const want = el.getAttribute && el.getAttribute('data-sfx');
+    if (want === 'none') return;
+    sfx(want || 'tap');
+  });
+
+  // 报告背景音乐。和音效一样，关了开关 / 没解锁时都得静默收场。
+  const startMusic = () => { try { if (window.SOUND) window.SOUND.music.start(); } catch (e) {} };
+  const stopMusic = () => { try { if (window.SOUND) window.SOUND.music.stop(); } catch (e) {} };
+
   function toast(msg, type = 'info', ms = 3800) {
     let box = $('#toast-box');
     if (!box) {
@@ -64,6 +98,9 @@
     el.className = 'toast ' + type;
     el.innerHTML = msg;
     box.appendChild(el);
+    // 结果类提示配声音，纯信息类不配 —— 提示条本来就密，每条都响会烦
+    if (type === 'ok') sfx('ok');
+    else if (type === 'error' || type === 'warn') sfx('err');
     requestAnimationFrame(() => el.classList.add('in'));
     setTimeout(() => {
       el.classList.remove('in');
@@ -71,6 +108,77 @@
       setTimeout(() => el.remove(), 400);
     }, ms);
   }
+
+  // ---------- 通用对话框（替代 prompt / confirm / alert） ----------
+  // 三个原生弹窗在 Electron 里都不能用或不该用：
+  //   · prompt()  直接抛 "prompt() is and will not be supported"，功能全废
+  //   · confirm() 能用，但会同步阻塞渲染进程，且是系统白框，跟暗色界面割裂
+  //   · alert()   同上，而且只是通知，用 toast 更轻
+  // 所以统一走这里：自绘的暗色直角卡片，Promise 化，不阻塞。
+  //   askText(标题, 默认值, 说明) → 返回去掉首尾空格的字符串；取消返回 null
+  //   askOk(标题, 说明, {danger}) → 返回 true / false
+  //   say(标题, 说明)             → 纯通知，无返回值
+  function dlg(o) {
+    o = o || {};
+    return new Promise(resolve => {
+      const mode = o.mode || 'confirm';           // text | confirm | say
+      const mask = document.createElement('div');
+      mask.className = 'modal-mask dlg-mask';
+      mask.innerHTML = `<div class="modal dlg">
+        <div class="m-head">${o.title || ''}</div>
+        ${o.sub ? `<div class="m-sub">${o.sub}</div>` : ''}
+        ${mode === 'text' ? '<input class="m-inp dlg-inp" type="text" autocomplete="off">' : ''}
+        <div class="m-actions">
+          ${mode === 'say' ? '' : `<button class="m-cancel dlg-no" type="button">取消</button>`}
+          <button class="m-ok dlg-yes${o.danger ? ' danger' : ''}" type="button">${o.okText || '确定'}</button>
+        </div>
+      </div>`;
+      document.body.appendChild(mask);
+      requestAnimationFrame(() => mask.classList.add('open'));
+      sfx('open');
+
+      const inp = mask.querySelector('.dlg-inp');
+      if (inp) inp.value = o.value == null ? '' : String(o.value);
+
+      let done = false;
+      const finish = (val) => {
+        if (done) return;
+        done = true;
+        // 取消/ESC/点遮罩才出「关闭」声；确认走的是后续动作（多半自己有提示音），
+        // 两声叠在一起会糊成一团
+        if (!val) sfx('close');
+        mask.classList.remove('open');
+        setTimeout(() => mask.remove(), 220);
+        document.removeEventListener('keydown', onKey, true);
+        resolve(val);
+      };
+      const onKey = (e) => {
+        if (e.key === 'Escape') { e.preventDefault(); finish(mode === 'text' ? null : false); }
+        else if (e.key === 'Enter' && (!inp || document.activeElement === inp)) { e.preventDefault(); submit(); }
+      };
+      const submit = () => {
+        if (mode === 'text') {
+          const v = inp.value.trim();
+          if (!v) { toast('内容不能为空', 'warn', 2000); inp.focus(); return; }
+          finish(v);
+        } else if (mode === 'say') { finish(true); }
+        else { finish(true); }
+      };
+
+      mask.querySelector('.dlg-yes').addEventListener('click', submit);
+      const noBtn = mask.querySelector('.dlg-no');
+      if (noBtn) noBtn.addEventListener('click', () => finish(mode === 'text' ? null : false));
+      mask.addEventListener('click', e => { if (e.target === mask) finish(mode === 'text' ? null : false); });
+      document.addEventListener('keydown', onKey, true);
+      if (inp) { inp.focus(); inp.setSelectionRange(inp.value.length, inp.value.length); }
+    });
+  }
+  const askText = (title, value, sub) => dlg({ mode: 'text', title, value, sub, okText: '保存' })
+    .then(v => (v === null || v === false ? null : String(v).trim()));
+  const askOk = (title, sub, extra) => dlg(Object.assign({ mode: 'confirm', title, sub }, extra || {}))
+    .then(v => v === true);
+  const say = (title, sub) => dlg({ mode: 'say', title, sub, okText: '知道了' });
+
   // 骨架屏占位
   function skeleton() {
     return `<div class="skel" aria-hidden="true">
@@ -112,6 +220,168 @@
   function pinnedIds() {
     return persons.filter(x => x.pinned).map(x => x.id);
   }
+  // ---------- 联系人右键菜单：自定义头像 ----------
+  // 三个入口（图片 / 表情 / 文字）+ 恢复默认。图片走 FileReader 转 dataURL 传给服务端落盘，
+  // 前端不存 base64，persons.json 里只留文件名。
+  const AVATAR_EMOJI = ['🌸', '🌙', '🍀', '⭐', '🐱', '🐰', '🦊', '🐻', '🐼', '🐧', '🍓', '🍰',
+    '☕', '🎧', '🎈', '💐', '🌊', '🔥', '❄️', '🍁', '🌻', '🫧', '🕊️', '💫'];
+
+  // 当前右键点开的是谁。菜单一关就作废，避免「刚给 A 设完，回头粘一下却设到了 B」。
+  let avaTarget = null;
+
+  function closeAvatarMenu() {
+    const m = document.getElementById('ava-menu');
+    if (m) m.remove();
+    avaTarget = null;
+  }
+  // 常驻的收起逻辑：点菜单外面、滚轮、Esc 都收。不来回挂载/解绑监听器，少一处漏解绑的坑。
+  if (!window.__avaGlobal) {
+    window.__avaGlobal = true;
+    document.addEventListener('mousedown', e => {
+      if (!e.target.closest || !e.target.closest('#ava-menu')) closeAvatarMenu();
+    }, true);
+    window.addEventListener('scroll', closeAvatarMenu, true);
+    window.addEventListener('resize', closeAvatarMenu);
+  }
+
+  function saveAvatar(p, body) {
+    return fetch('/api/person/' + p.id + '/avatar', {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+    }).then(async r => {
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) { toast(d.error || '设置头像失败', 'err'); return; }
+      p.avatar = d.avatar;
+      p.avatarImg = d.avatarImg;
+      renderList();
+      toast('头像已更新', 'ok', 1800);
+    }).catch(() => toast('设置头像失败', 'err'));
+  }
+
+  // 图片统一走这里：居中裁成正方形 + 缩到 512，再转 dataURL。
+  // 手机照片动辄 6~10MB，直传会撞服务端 4MB 上限（用户只看到「图片太大」）；裁方是因为
+  // 头像是圆形，不裁的话长图会被压成一条。白底 + jpeg 是刻意的：照片用不上透明通道，
+  // 而 png 的 dataURL 体积会翻好几倍。
+  const AVATAR_PX = 512;
+  function readAvatarImage(file) {
+    return new Promise((resolve, reject) => {
+      if (!file || !/^image\//.test(file.type || '')) return reject(new Error('这不是图片'));
+      const url = URL.createObjectURL(file);
+      const img = new Image();
+      const done = (fn, v) => { URL.revokeObjectURL(url); fn(v); };
+      img.onload = () => {
+        try {
+          const side = Math.min(img.naturalWidth, img.naturalHeight);
+          if (!side) throw new Error('图片读不出来');
+          const c = document.createElement('canvas');
+          c.width = c.height = AVATAR_PX;
+          const g = c.getContext('2d');
+          g.fillStyle = '#fff';
+          g.fillRect(0, 0, AVATAR_PX, AVATAR_PX);
+          g.drawImage(img, (img.naturalWidth - side) / 2, (img.naturalHeight - side) / 2, side, side, 0, 0, AVATAR_PX, AVATAR_PX);
+          done(resolve, c.toDataURL('image/jpeg', .88));
+        } catch (e) { done(reject, e); }
+      };
+      img.onerror = () => done(reject, new Error('读不出这张图'));
+      img.src = url;
+    });
+  }
+
+  // 任何来源的图片都收口到这里（选文件 / 拖进来 / 粘贴），少三份重复的错误提示
+  function useAvatarImage(p, file) {
+    readAvatarImage(file)
+      .then(dataUrl => saveAvatar(p, { img: dataUrl }))
+      .catch(e => toast(e.message || '这张图用不了', 'err'));
+  }
+
+  function pickAvatarFile(p) {
+    let inp = document.getElementById('ava-file');
+    if (!inp) {
+      inp = document.createElement('input');
+      inp.id = 'ava-file';
+      inp.type = 'file';
+      inp.accept = 'image/*';
+      inp.style.display = 'none';
+      document.body.appendChild(inp);
+    }
+    inp.value = '';
+    inp.onchange = () => { if (inp.files && inp.files[0]) useAvatarImage(p, inp.files[0]); };
+    inp.click();
+  }
+
+  function openAvatarMenu(p, x, y) {
+    closeAvatarMenu();
+    const menu = document.createElement('div');
+    menu.id = 'ava-menu';
+    menu.className = 'ava-menu';
+    menu.innerHTML = `
+      <div class="am-t">${esc(p.name)} · 头像</div>
+      <div class="am-g" id="amEmoji">${AVATAR_EMOJI.map(e => `<b data-e="${e}">${e}</b>`).join('')}</div>
+      <div class="am-i" data-a="img">🖼　上传照片（或拖进窗口 / Ctrl+V）</div>
+      <div class="am-i" data-a="text">✎　用文字（1～2 个字）</div>
+      <div class="am-i" data-a="reset">↺　恢复默认</div>`;
+    document.body.appendChild(menu);
+    avaTarget = p;   // 供 Ctrl+V 粘贴用
+    // 贴边不越界：先量再摆
+    const r = menu.getBoundingClientRect();
+    menu.style.left = Math.max(6, Math.min(x, window.innerWidth - r.width - 6)) + 'px';
+    menu.style.top = Math.max(6, Math.min(y, window.innerHeight - r.height - 6)) + 'px';
+
+    menu.querySelectorAll('.am-g b').forEach(b => b.addEventListener('click', () => {
+      closeAvatarMenu();
+      saveAvatar(p, { text: b.dataset.e });
+    }));
+    menu.querySelectorAll('.am-i').forEach(it => it.addEventListener('click', async () => {
+      const a = it.dataset.a;
+      closeAvatarMenu();
+      if (a === 'img') return pickAvatarFile(p);
+      if (a === 'reset') return saveAvatar(p, { reset: true });
+      const v = await askText('用文字做头像', p.avatar || '', '1～2 个字最合适，中文英文 emoji 都行');
+      if (v) saveAvatar(p, { text: v });
+    }));
+  }
+
+  // ---------- 拖照片 / 粘贴照片换头像 ----------
+  // 粘贴走 avaTarget（菜单开着才生效）；拖拽直接认拖到哪一行，不用先右键。
+  const anyImage = (dt) => {
+    if (!dt) return null;
+    for (const f of dt.files || []) if (/^image\//.test(f.type || '')) return f;
+    for (const it of dt.items || []) if (it.kind === 'file' && /^image\//.test(it.type || '')) return it.getAsFile();
+    return null;
+  };
+  if (!window.__avaDrop) {
+    window.__avaDrop = true;
+    document.addEventListener('paste', e => {
+      if (!avaTarget) return;
+      const f = anyImage(e.clipboardData);
+      if (!f) return;
+      e.preventDefault();
+      const p = avaTarget;
+      closeAvatarMenu();
+      useAvatarImage(p, f);
+    });
+    // 拖到联系人那一条上就换那一条，拖到别处不拦（别把整窗拖放行为都吃掉）
+    const row = (t) => t && t.closest && t.closest('.person');
+    document.addEventListener('dragover', e => {
+      const el = row(e.target);
+      if (!el || !anyImage(e.dataTransfer)) return;
+      e.preventDefault();
+      el.classList.add('drop-ava');
+    });
+    document.addEventListener('dragleave', e => {
+      const el = row(e.target);
+      if (el) el.classList.remove('drop-ava');
+    });
+    document.addEventListener('drop', e => {
+      const el = row(e.target);
+      if (el) el.classList.remove('drop-ava');
+      const f = el && anyImage(e.dataTransfer);
+      if (!f) return;
+      e.preventDefault();
+      const p = persons.find(x => x.id === el.dataset.id);
+      if (p && !p.group) useAvatarImage(p, f);
+    });
+  }
+
   function renderList() {
     const pins = pinnedIds();
     // 置顶优先；其余按消息同步顺序（最近消息时间 last 降序），无 last 的兜底按消息数
@@ -133,7 +403,10 @@
       <div class="person ${current && current.id === p.id ? 'on' : ''}" data-id="${p.id}">
         ${p.group
           ? `<div class="ava">群</div>`
-          : `<div class="ava"><span class="avfallback">${p.avatar || '?'}</span></div>`}
+          : `<div class="ava${p.avatarImg ? ' hasimg' : ''}" title="右键换头像">
+              ${p.avatarImg ? `<img class="avimg" src="/api/avatar/${p.id}" alt="">` : ''}
+              <span class="avfallback">${esc(p.avatar || (p.name || '?')[0] || '?')}</span>
+            </div>`}
         <div class="nm-wrap"><div class="nm" title="${p.name}">${p.name}${p.group ? ' <span class="grp">群聊</span>' : ''}</div><div class="sub">${p.msgs || 0} 条消息${!p.group && p.coldDays >= 3 ? ` <span class="cold">已 ${p.coldDays} 天未联系</span>` : ''}</div></div>
         <div class="ops">
           <span class="op pin ${pins.includes(p.id) ? 'on' : ''}" title="置顶">${pins.includes(p.id) ? '★' : '☆'}</span>
@@ -141,23 +414,42 @@
         </div>
       </div>`).join('');
     listEl.querySelectorAll('.person').forEach(el => {
-      el.addEventListener('click', () => selectPerson(el.dataset.id));
+      el.addEventListener('click', (e) => {
+        // 换联系人是个「大动作」，用 nav 而不是通用 tap。
+        // 标记 e.__sfx 让 document 上那个通用点击音闭嘴，别两声叠一起。
+        e.__sfx = 1;
+        sfx('nav');
+        selectPerson(el.dataset.id);
+      });
+      el.addEventListener('contextmenu', e => {
+        e.preventDefault();
+        e.stopPropagation();
+        const p = persons.find(x => x.id === el.dataset.id);
+        if (p && !p.group) openAvatarMenu(p, e.clientX, e.clientY);
+      });
+      const img = el.querySelector('.avimg');
+      if (img) img.addEventListener('error', () => { img.parentNode.classList.remove('hasimg'); });
       el.querySelector('.pin').addEventListener('click', e => {
         e.stopPropagation();
         const id = el.dataset.id;
         fetch('/api/person/' + id + '/pin', { method: 'PUT' }).then(r => {
-          if (!r.ok) { alert('置顶失败'); return; }
+          if (!r.ok) { toast('置顶失败', 'err'); return; }
           const p = persons.find(x => x.id === id);
           p.pinned = !p.pinned;
           renderList();
         });
       });
-      el.querySelector('.del').addEventListener('click', e => {
+      el.querySelector('.del').addEventListener('click', async e => {
         e.stopPropagation();
         const p = persons.find(x => x.id === el.dataset.id);
-        if (!confirm(`删除联系人「${p.name}」？\n将同时移除其聊天缓存，可恢复备份保留在 trash.json。`)) return;
+        const yes = await askOk(
+          `删除联系人「${p.name}」？`,
+          '将同时移除其聊天缓存。可恢复的备份会保留在 trash.json，需要时能找回。',
+          { okText: '删除', danger: true }
+        );
+        if (!yes) return;
         fetch('/api/person/' + el.dataset.id, { method: 'DELETE' }).then(r => {
-          if (!r.ok) { alert('删除失败'); return; }
+          if (!r.ok) { toast('删除失败', 'err'); return; }
           persons = persons.filter(x => x.id !== el.dataset.id);
           if (current && current.id === el.dataset.id) { current = null; main.innerHTML = `<div class="ph">← 选择左侧联系人查看分析</div>`; }
           renderList();
@@ -189,6 +481,7 @@
     } else {
       html = `
       ${d.coldDays >= 3 ? `<div class="warn"><b>冷场预警</b> · 已 ${d.coldDays} 天没有联系了，主动发条消息吧</div>` : ''}
+      ${reportEntry(d)}
       ${d.roast && d.roast.lines && d.roast.lines.length ? roastCard(d) : ''}
       <div class="row">
         <div class="card col">${gaugesCard(d)}</div>
@@ -198,6 +491,7 @@
         <div class="card col">${likesCard(d)}</div>
         <div class="card col">${anniversariesCard(d)}</div>
       </div>
+      <div class="card pm-card">${promisesCard(d)}</div>
       ${imgCard(d)}
       <div class="card trend-card">${trendCard(d)}</div>
       <div class="card">${wordsCard(d)}</div>
@@ -211,6 +505,10 @@
     requestAnimationFrame(() => requestAnimationFrame(() => v.classList.add('in')));
     bindMain(d);
     bindRoastAi(d);
+    bindAdviceAi(d);
+    bindReportEntry(d);
+    mountPromises(d);            // 承诺是异步读的（要跟服务端要最新状态），回来再补画卡片
+    bindWordsAi(d);
     if (aiState.ready) tryEnrichAi(d, id); // 本地AI 就绪时自动补「情感基调 / 关系洞察」
     // 联系人切换后右侧自动回到顶部，避免用户手动上翻
     window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -221,7 +519,11 @@
   function roastCard(d) {
     const r = d.roast;
     const rows = r.lines.map(l => `<div class="roast-line">${esc(l)}</div>`).join('');
-    const advice = r.advice ? `<div class="roast-advice"><span class="ra-tt">${esc(r.adviceTitle || '狗头军师 · 相处建议')}</span><div class="ra-body">${esc(r.advice)}</div></div>` : '';
+    // 狗头军师也走真 AI：和锐评一样给一个按钮，各写各的，互不影响
+    const advice = r.advice ? `<div class="roast-advice">
+        <div class="ra-head"><span class="ra-tt">${esc(r.adviceTitle || '狗头军师 · 相处建议')}</span>
+          <button class="roast-ai-btn" id="adviceAiBtn" title="让本地 AI 按真实统计现写一条建议，每次都不一样">✦ AI 建议</button></div>
+        <div class="ra-body" id="adviceBody">${esc(r.advice)}</div></div>` : '';
     return `<div class="roast" data-roast-id="${esc(d.id || '')}">
       <div class="roast-head">
         <span class="roast-tt">${esc(r.title)}</span><span class="roast-sub">${esc(r.sub)}</span>
@@ -230,6 +532,42 @@
       <div class="roast-lines">${rows}</div>
       ${advice}
     </div>`;
+  }
+  // 狗头军师建议：独立按钮、独立接口。模板那条一直留着当兜底，模型失败就退回它。
+  function bindAdviceAi(d) {
+    const btn = document.getElementById('adviceAiBtn');
+    const body = document.getElementById('adviceBody');
+    if (!btn || !body) return;
+    const backup = body.textContent;
+    btn.addEventListener('click', async () => {
+      if (!aiState.ready) {
+        toast('先选一个本地 AI 模型，再让它出主意', 'info', 3200);
+        openAiPanel();
+        return;
+      }
+      btn.disabled = true;
+      btn.textContent = '想主意中…';
+      const card = btn.closest('.roast');
+      if (card) card.classList.add('ai-thinking');
+      try {
+        const resp = await fetch('/api/ai/advice', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ d }),
+        });
+        const j = await resp.json().catch(() => ({}));
+        if (!resp.ok || !j || !j.ok) throw new Error((j && j.error) || ('HTTP ' + resp.status));
+        body.innerHTML = esc(j.advice)
+          + (j.grounded === false ? '<div class="ra-caveat">这版出现了统计里没有的数字，参考着看</div>' : '');
+        btn.textContent = '✦ 换个主意';
+      } catch (e) {
+        body.textContent = backup;
+        btn.textContent = '✦ AI 建议';
+        toast('生成失败：' + (e && e.message ? e.message : '未知错误'), 'error', 4200);
+      } finally {
+        btn.disabled = false;
+        if (card) card.classList.remove('ai-thinking');
+      }
+    });
   }
   // 「AI 重写」：把模板锐评换成模型现场写的，内容只在本机生成
   function bindRoastAi(d) {
@@ -282,27 +620,48 @@
   function aiModelLabel() {
     const s = aiState;
     if (!s.ready) return '';
-    if (s.backend === 'ollama') return s.model || '本机模型';
-    if (s.backend === 'builtin') {
-      const t = (s.tiers || []).find(x => x.key === s.tier);
-      return t ? ('内置 ' + t.params) : '内置模型';
-    }
-    return s.model || '';
+    // 只剩内置后端了，所以不再按 backend 分岔：
+    // 优先用档位元数据说人话（「内置 3B」），拿不到才退回模型文件名。
+    const t = (s.tiers || []).find(x => x.key === s.tier);
+    return t ? ('内置 ' + t.params) : (s.model || '内置模型');
   }
+  // 剩余时间说人话：秒 → 「不到 1 分钟 / 12 分钟 / 1 小时 5 分」
+  function fmtEta(sec) {
+    if (!sec || sec <= 0) return '';
+    if (sec < 60) return '不到 1 分钟';
+    const m = Math.round(sec / 60);
+    if (m < 60) return m + ' 分钟';
+    return Math.floor(m / 60) + ' 小时 ' + (m % 60) + ' 分';
+  }
+  // 已经闲置多久了（显存那栏用）
+  const fmtIdle = sec => (!sec || sec < 60 ? Math.round(sec || 0) + ' 秒' : Math.round(sec / 60) + ' 分钟');
   function renderAiBar() {
     const bar = $('#aiBar');
     if (!bar) return;
     const s = aiState;
     let cls = 'ai-bar', html;
-    if (s.downloading) {
+    if (s.verifying) {
+      // 算哈希就几秒，但必须给个说法，否则用户会以为卡死了
       cls += ' busy';
-      html = '🧠 正在下载内置模型 ' + (s.progress || 0) + '%';
+      html = '🧠 正在校验模型完整性…<span class="ai-bar-sub">校验通过才会启用，防止用到损坏的文件</span>';
+    } else if (s.downloading) {
+      cls += ' busy';
+      const mb = s.downloadedMB || 0, tot = s.totalMB || 0;
+      const size = tot
+        ? (mb >= 1024 ? (mb / 1024).toFixed(2) : mb) + ' / ' + (tot / 1024).toFixed(1) + ' GB'
+        : '';
+      const spd = s.speedMBps ? ' · ' + s.speedMBps + ' MB/s' : '';
+      const eta = s.etaSec > 0 ? ' · 还剩 ' + fmtEta(s.etaSec) : '';
+      html = '🧠 下载内置模型 ' + (s.progress || 0) + '%<span class="ai-bar-sub">' + esc(size + spd + eta) + '</span>';
     } else if (s.ready) {
       cls += ' ok';
-      html = '🧠 ' + (s.backend === 'ollama' ? '本机 Ollama' : '内置模型') + ' · ' + esc(aiModelLabel());
-    } else if (s.ollamaReady && (s.ollamaModels || []).some(m => m.usable)) {
-      cls += ' off';
-      html = '🧠 发现本机 Ollama · 点此启用（零下载）';
+      // 模型还在，但闲下来就把显存还回去了 —— 这事必须说出来，
+      // 否则用户看到「就绪」却觉得自己显存被动过，反而更慌。
+      const back = s.evicted
+        ? '已归还显存（闲置 ' + fmtIdle(s.idleSec) + '）· 下次使用自动装回，不用你管'
+        : '正在占用显存 · 闲置 ' + (s.idleLimit || 120) + ' 秒后自动归还';
+      html = '🧠 内置模型 · ' + esc(aiModelLabel())
+        + '<span class="ai-bar-sub">' + esc(back) + '</span>';
     } else if (s.installed) {
       cls += ' ok';
       html = '🧠 内置模型已下载 · 点此加载';
@@ -310,10 +669,18 @@
       cls += ' off';
       html = '🧠 本地AI 未启用 · 点此选择模型';
     }
-    bar.className = cls;
-    bar.title = s.ready
+    const title = s.ready
       ? ('当前模型：' + (s.model || '') + '　点击更换')
       : '点击选择本地 AI 模型';
+    // 这个函数挂在 3 秒轮询上，而「未启用」「已下载未加载」正是最常见的两个长期状态，
+    // 它们每次算出来的输出完全一样。innerHTML 赋值不比较内容 —— 传进去的字符串哪怕
+    // 一模一样，也会把整棵子树拆了重建：过渡动画从头开始、用户选中的文字被清掉。
+    // 所以先比签名，没变就彻底不动。
+    const sig = cls + '\u0000' + title + '\u0000' + html;
+    if (bar._sig === sig) return;
+    bar._sig = sig;
+    bar.className = cls;
+    bar.title = title;
     bar.innerHTML = html;
   }
   function pollAiStatus() {
@@ -326,7 +693,7 @@
     aiPollTimer = setInterval(async () => {
       const s = await pollAiStatus();
       if (!s) return;
-      if (!s.downloading) {
+      if (!s.downloading && !s.verifying) {
         clearInterval(aiPollTimer); aiPollTimer = null;
         if (s.ready) {
           toast('本地 AI 已就绪 · ' + aiModelLabel(), 'info', 4000);
@@ -342,22 +709,11 @@
     if (bar) bar.addEventListener('click', openAiPanel);
   }
 
-  // 模型选择面板：本机 Ollama（零下载）+ 内置三档（给别人下载用）
+  // 模型选择面板：三档内置模型
   function openAiPanel() {
     const old = document.getElementById('aiPanel');
     if (old) { old.remove(); return; }
     const s = aiState;
-
-    const ollamaList = s.ollamaModels || [];
-    const ollamaHtml = !s.ollamaReady
-      ? '<div class="ai-empty">没检测到本机 Ollama 服务。<br>装了 Ollama 的话，启动它就能零下载直接使用。</div>'
-      : (ollamaList.length
-        ? ollamaList.map(m => `
-            <button class="ai-opt${m.usable ? '' : ' bad'}${s.backend === 'ollama' && s.model === m.name ? ' cur' : ''}" data-model="${esc(m.name)}"${m.usable ? '' : ' disabled'}>
-              <span class="ao-name">${esc(m.name)}</span>
-              <span class="ao-meta">${esc(m.params || '')}${m.params ? ' · ' : ''}${m.sizeGB ? m.sizeGB + ' GB' : ''}${m.note ? ' · ' + esc(m.note) : ''}</span>
-            </button>`).join('')
-        : '<div class="ai-empty">Ollama 在运行，但里面还没有对话模型。</div>');
 
     const tiersHtml = (s.tiers || []).map(t => `
       <button class="ai-opt${t.installed ? ' inst' : ''}${s.backend === 'builtin' && s.tier === t.key ? ' cur' : ''}" data-tier="${t.key}">
@@ -375,11 +731,7 @@
       </div>
       <div class="ai-panel-body">
         <div class="ap-sec">
-          <div class="ap-sec-tt">用本机 Ollama<span class="ap-tag">零下载</span></div>
-          <div class="ap-grid">${ollamaHtml}</div>
-        </div>
-        <div class="ap-sec">
-          <div class="ap-sec-tt">下载内置模型<span class="ap-tag gray">分发给别人走这条</span></div>
+          <div class="ap-sec-tt">选择档位<span class="ap-tag gray">按显存挑</span></div>
           <div class="ap-grid">${tiersHtml}</div>
         </div>
         <div class="ap-foot">
@@ -394,22 +746,6 @@
       if (e.target === ov || e.target.id === 'apClose') ov.remove();
     });
 
-    ov.querySelectorAll('.ai-opt[data-model]').forEach(btn => btn.addEventListener('click', async () => {
-      const name = btn.dataset.model;
-      toast('正在启用 ' + name + '…', 'info', 3000);
-      try {
-        const r = await fetch('/api/ai/setup', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ backend: 'ollama', model: name }),
-        });
-        aiState = await r.json();
-        renderAiBar();
-        toast(aiState.ready ? ('已启用：' + name) : ('启用失败：' + (aiState.error || '未知')), aiState.ready ? 'info' : 'error', 3200);
-        const p = document.getElementById('aiPanel'); if (p) p.remove();
-        if (aiState.ready && current) tryEnrichAi(current, current.id);
-      } catch (e) { toast('启用失败：' + e.message, 'error', 3200); }
-    }));
-
     ov.querySelectorAll('.ai-opt[data-tier]').forEach(btn => btn.addEventListener('click', async () => {
       const key = btn.dataset.tier;
       const t = (aiState.tiers || []).find(x => x.key === key) || {};
@@ -418,7 +754,7 @@
       try {
         const r = await fetch('/api/ai/setup', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ backend: 'builtin', tier: key }),
+          body: JSON.stringify({ tier: key }),
         });
         aiState = await r.json();
         renderAiBar();
@@ -461,11 +797,29 @@
   }
 
   // ---------- 半圆仪表盘 ----------
+  // 三个指数的构成（口径见 score.js）。注释要跟实现说同一件事，
+  // 不然用户点开「分数怎么算的」看到的是一套早就改过的旧说法。
   const GAUGE_HINT = {
-    active: '谁更常发起对话：你主动发起的占比越高分越高',
-    loved: 'TA 的回应热情：TA 消息占比 + 回复速度',
-    cold: 'TA 的敷衍程度：单字/短回复占比越高越冷'
+    active: '你在推进这段关系上用了多少力：谁先开口 · 消息占比 · 连发 · 回复速度差 · 消息长度比。分数高不等于关系好，也可能只是你一个人在推',
+    loved: 'TA 给你的温度：TA 的消息占比与主动次数 · 回复速度 · 晚安/早安 · 关心你的频率，再按「是不是你单方面撑起对话」打折',
+    cold: 'TA 的敷衍与回避：「嗯/哦/好」这类单字短回 · 你发完话两小时内没人接 · 超过半小时才回的比例'
   };
+  // 分数构成：每一路信号实际是多少、贡献了几分。分数必须能解释。
+  function partsHtml(g) {
+    if (!g || !g.parts || !g.parts.length) return '';
+    return `<div class="g-parts">` + g.parts.map(p => {
+      const sign = p.delta > 0 ? '+' : '';
+      const cls = p.delta > 0 ? ' up' : p.delta < 0 ? ' dn' : '';
+      return `<span class="gp${cls}">${p.label} <b>${p.text}</b> <i>${sign}${p.delta}</i></span>`;
+    }).join('') + `</div>`;
+  }
+  // 对称性：两个人在共同经营，还是一个人在推（借鉴「她不一样」的单相思提醒）
+  function symLine(d) {
+    if (typeof d.symmetry !== 'number') return '';
+    const s = d.symmetry;
+    const word = s >= 75 ? '两个人在共同经营' : s >= 50 ? '略有倾斜，还算平衡' : '基本是单方面在推';
+    return `<div class="g-sym">对称性 <b>${s}</b> 分 · ${word}</div>`;
+  }
   function gaugesCard(d) {
     return `<div class="sec-t">关系指数</div><div class="gauges">` + d.gauges.map(g => {
       const v = g.value;
@@ -481,7 +835,7 @@
         </svg>
         <div class="big">${v}</div><div class="lbl">${g.label}</div>
       </div>`;
-    }).join('') + `<details class="note-f"><summary>指标注释</summary>${d.gauges.map(g => `<div class="nh">${g.label}：${GAUGE_HINT[g.key] || ''}</div>`).join('')}</details></div>`;
+    }).join('') + symLine(d) + `<details class="note-f"><summary>分数怎么算的</summary>${d.gauges.map(g => `<div class="nh"><b>${g.label}</b>${GAUGE_HINT[g.key] || ''}</div>${partsHtml(g)}`).join('')}</details></div>`;
   }
 
   // ---------- 趋势平滑折线 ----------
@@ -596,8 +950,10 @@
       const rm = st.me[i] / 100 * rMax, rt = st.ta[i] / 100 * rMax;
       const xm = cx + (rm - 7) * Math.cos(a), ym = cy + (rm - 7) * Math.sin(a) + 2.5;
       const xt = cx + (rt + 8) * Math.cos(a), yt = cy + (rt + 8) * Math.sin(a) + 2.5;
-      return `<text x="${xm.toFixed(1)}" y="${ym.toFixed(1)}" text-anchor="middle" fill="#4fd0ff" font-size="8" font-family="Georgia,serif" font-variant-numeric="tabular-nums">${st.me[i]}</text>` +
-             `<text x="${xt.toFixed(1)}" y="${yt.toFixed(1)}" text-anchor="middle" fill="#e0bc72" font-size="8" font-family="Georgia,serif" font-variant-numeric="tabular-nums">${st.ta[i]}</text>`;
+      // 雷达图上的分值：字体和 SVG 里的趋势轴一个口径（Cambria + 等高数字），
+      // Georgia 的老式数字在这里会让「74」和「18」看起来不一样高
+      return `<text x="${xm.toFixed(1)}" y="${ym.toFixed(1)}" text-anchor="middle" fill="#4fd0ff" font-size="8" font-family="Cambria,Times New Roman,serif" font-variant-numeric="lining-nums tabular-nums">${st.me[i]}</text>` +
+             `<text x="${xt.toFixed(1)}" y="${yt.toFixed(1)}" text-anchor="middle" fill="#e0bc72" font-size="8" font-family="Cambria,Times New Roman,serif" font-variant-numeric="lining-nums tabular-nums">${st.ta[i]}</text>`;
     }).join('');
     const explain = {
       '激情': '谁更主动投入：蓝色=你发起对话/发消息的占比，黄色=TA主动的占比。分越高越主动',
@@ -635,8 +991,48 @@
       <div class="wc-col"><div class="wc-t">${title}</div><div class="wc-tags">${
         arr.length ? arr.map(x => tag(x.w, x.n, max, cls)).join('') : '<span class="wd empty">暂无数据</span>'
       }</div></div>`;
-    return `<div class="sec-t">热词榜 · 话题画像</div>
-      <div class="wc">${col('你常说的', wm, maxN(wm), 'me')}${col(`${d.person.name}常说的`, wt, maxN(wt), 'ta')}</div>`;
+    return `<div class="wc-head">
+        <div class="sec-t">热词榜 · 话题画像</div>
+        <button class="wc-ai" id="wcAi" type="button" title="用本地模型把高频词归纳成几个话题，全部在本机跑">✦ AI 归纳话题</button>
+      </div>
+      <div class="wc">${col('你常说的', wm, maxN(wm), 'me')}${col(`${d.person.name}常说的`, wt, maxN(wt), 'ta')}</div>
+      <div class="wc-topics" id="wcTopics"></div>`;
+  }
+
+  // AI 话题结果渲染（词表由服务端白名单过滤过，这里直接画）
+  function paintTopics(list, d) {
+    const box = $('#wcTopics');
+    if (!box) return;
+    box.innerHTML = `<div class="wt-h"><span class="wt-t">AI 归纳的话题</span>
+        <span class="wt-again" id="wtAgain">换一批</span></div>` +
+      list.map(t => `<div class="wt-row">
+          <span class="wt-k">${esc(t.label)}</span>
+          <span class="wt-w">${t.words.map(w => `<b>${esc(w)}</b>`).join('')}</span>
+        </div>`).join('');
+    const again = box.querySelector('#wtAgain');
+    if (again) again.addEventListener('click', () => runTopicsAi(d, true));
+  }
+
+  function runTopicsAi(d, force) {
+    const btn = $('#wcAi');
+    const box = $('#wcTopics');
+    if (!aiState.ready) { toast('本地 AI 还没启用 · 在左侧「本地小AI」里开一下再回来', 'warn', 4200); return; }
+    if (btn) { btn.classList.add('busy'); btn.textContent = '正在归纳…'; }
+    fetch('/api/topwords/ai', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ personId: d.person.id, force: !!force })
+    }).then(async r => {
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) { toast(j.error || 'AI 归纳失败', 'err', 4200); return; }
+      if (!j.topics || !j.topics.length) { toast('这次没归纳出话题，再点一次试试', 'warn', 3600); return; }
+      paintTopics(j.topics, d);
+    }).catch(() => toast('AI 归纳失败', 'err'))
+      .then(() => { if (btn) { btn.classList.remove('busy'); btn.textContent = '✦ AI 归纳话题'; } });
+  }
+
+  function bindWordsAi(d) {
+    const btn = $('#wcAi');
+    if (btn) btn.addEventListener('click', () => runTopicsAi(d, false));
   }
 
   // ---------- 情绪基调 ----------
@@ -672,7 +1068,7 @@
       const badge = m.img ? (m.emoji ? (emojiChip || '<span class="img-badge">表情</span>') : '<span class="img-badge">图片</span>') : '';
       const videoBadge = m.video ? '<span class="img-badge video">▶ 视频</span>' : '';
       const linkBadge = m.link ? '<span class="img-badge link">🔗 链接</span>' : '';
-      const thumb = m.img && !m.emoji && m.t ? `<img class="tl-img" src="${_taImgUrl('/api/img-thumb?ts=' + m.t)}" loading="lazy" onerror="this.remove()" alt="图片">` : '';
+      const thumb = m.img && !m.emoji && m.t ? `<img class="tl-img" src="${_taImgUrl('/api/img-thumb?ts=' + m.t)}" loading="lazy" alt="图片">` : '';
       const linkText = m.link ? (m.text || '').replace(/^\[链接\]\s*/, '') : (m.text || '');
       const body = m.voice ? voiceBody(m)
         : m.video ? (videoBadge + '<span class="vox-t">' + esc(m.text) + '</span>')
@@ -747,6 +1143,746 @@
       </div>`).join('');
   }
 
+  // ==================== 承诺追踪 ====================
+  // 数据由服务端合成（自动识别 + 用户手动维护），所以每次改动都要回服务端再重绘，
+  // 不在这里做本地乐观更新 —— 免得和后端的 id 对不上。
+  let promiseState = null;
+
+  function fmtDayShort(ts) {
+    if (!ts) return '';
+    const d2 = new Date(ts > 1e12 ? ts : ts * 1000);
+    const p = (n) => String(n).padStart(2, '0');
+    return p(d2.getMonth() + 1) + '-' + p(d2.getDate());   // 统一两位，免得出现「10-01 / 9-23」这样参差不齐
+  }
+  // 秒 → 人话（"3 秒" / "12 分钟" / "2 小时"）
+  function fmtDur(sec) {
+    if (!sec) return '—';
+    if (sec < 60) return Math.round(sec) + ' 秒';
+    if (sec < 3600) return Math.round(sec / 60) + ' 分钟';
+    return (sec / 3600).toFixed(1) + ' 小时';
+  }
+
+  function promisesCard(d) {
+    const st = promiseState;
+    if (!st) return `<div class="sec-t">承诺追踪</div><div class="pm-empty">读取中…</div>`;
+    const items = st.items || [];
+    const doneN = items.filter(x => x.done).length;
+    const taName = (d.person && d.person.name) || 'TA';
+    const rows = items.map(it => `
+      <div class="pm-item ${it.done ? 'done' : ''}" data-id="${esc(it.id)}">
+        <button class="pm-check" title="${it.done ? '取消兑现' : '标记已兑现'}">${it.done ? '✓' : ''}</button>
+        <span class="pm-who ${it.who === 'me' ? 'me' : 'ta'}">${it.who === 'me' ? '我' : esc(taName)}</span>
+        <span class="pm-mid"><span class="pm-text">${esc(it.text)}<svg class="pm-strike" viewBox="0 0 100 10" preserveAspectRatio="none">
+          <path class="s1" pathLength="100" d="M1 5 C 25 2.5, 60 7, 99 5"/>
+          <path class="s2" pathLength="100" d="M3 6.5 C 40 8.5, 75 3.5, 97 6.5"/>
+        </svg></span></span>
+        <span class="pm-date">${fmtDayShort(it.at)}</span>
+        <i class="pm-edit" title="改内容">✎</i>
+        <button class="pm-del" title="删除（之后重新分析也不会再出现）">×</button>
+      </div>`).join('');
+    const arch = doneN ? `<div class="pm-archive">
+        <span class="pa-tip">已兑现 ${doneN} · ${st.keepForever ? '永久保留' : `完成满 ${st.keepDays} 天自动清空`}</span>
+        <button class="pa-btn pa-keep${st.keepForever ? ' on' : ''}" id="pmKeep" title="${st.keepForever ? '已永久保留 · 点击恢复自动清理' : '开启后已兑现的永久保留'}">保留</button>
+        <button class="pa-btn pa-clear" id="pmClear" title="立即清空所有已兑现">清空</button>
+      </div>` : '';
+    return `<div class="sec-t">承诺追踪<span class="pm-count">兑现 <b>${doneN}</b><span class="pm-slash">/</span><b>${items.length}</b></span></div>
+      <div class="pm-list">${rows || '<div class="pm-empty">还没认出承诺。<br>说过「下周带你去…」这类话就会被记下来。</div>'}</div>
+      <div class="pm-add">
+        <select class="pm-who-sel" title="这条是谁许的">
+          <option value="me">我</option>
+          <option value="ta">${esc(taName)}</option>
+        </select>
+        <input class="pm-input" type="text" placeholder="加一条承诺…" autocomplete="off">
+        <button class="pm-add-btn" title="添加">＋</button>
+      </div>
+      ${arch}`;
+  }
+
+  function pmPost(pid, body) {
+    return fetch('/api/promises/' + pid, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    }).then(r => r.json()).then(s => { if (s && s.ok) promiseState = s; return s; }).catch(() => null);
+  }
+
+  async function mountPromises(d) {
+    const card = main.querySelector('.pm-card');
+    if (!card) return;
+    try {
+      const r = await fetch('/api/promises/' + d.person.id);
+      const s = await r.json();
+      promiseState = (s && s.ok) ? s : { items: [], keepDays: 15, keepForever: false };
+    } catch (e) {
+      promiseState = { items: [], keepDays: 15, keepForever: false };
+    }
+    paintPromises(d);
+  }
+
+  function paintPromises(d) {
+    const card = main.querySelector('.pm-card');
+    if (!card) return;
+    card.innerHTML = promisesCard(d);
+    wirePromises(d);
+  }
+
+  function wirePromises(d) {
+    const pid = d.person.id;
+    const card = main.querySelector('.pm-card');
+    if (!card) return;
+
+    card.querySelectorAll('.pm-item').forEach(item => {
+      const id = item.dataset.id;
+      const cur = (promiseState.items || []).find(x => x.id === id);
+
+      const check = item.querySelector('.pm-check');
+      if (check) check.addEventListener('click', async () => {
+        const wasDone = !!(cur && cur.done);
+        await pmPost(pid, { op: 'update', id, done: !wasDone });
+        if (!wasDone) toast('已兑现 ✓ 说好的事做到了', 'info', 2400);
+        paintPromises(d);
+      });
+
+      const del = item.querySelector('.pm-del');
+      if (del) del.addEventListener('click', async () => {
+        await pmPost(pid, { op: 'delete', id });
+        toast('已删掉这条', 'info', 1800);
+        paintPromises(d);
+      });
+
+      const edit = item.querySelector('.pm-edit');
+      if (edit) edit.addEventListener('click', () => startPmEdit(d, item, id));
+    });
+
+    const addBtn = card.querySelector('.pm-add-btn');
+    const input = card.querySelector('.pm-input');
+    const whoSel = card.querySelector('.pm-who-sel');
+    const doAdd = async () => {
+      const t = (input && input.value || '').trim();
+      if (!t) { if (input) input.focus(); return; }
+      await pmPost(pid, { op: 'add', text: t, who: whoSel ? whoSel.value : 'me' });
+      toast('已加进承诺清单', 'info', 2000);
+      paintPromises(d);
+    };
+    if (addBtn) addBtn.addEventListener('click', doAdd);
+    if (input) input.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); doAdd(); } });
+
+    const keep = card.querySelector('#pmKeep');
+    if (keep) keep.addEventListener('click', async () => {
+      const on = !(promiseState.keepForever);
+      await pmPost(pid, { op: 'keep', value: on });
+      toast(on ? '已开启永久保留：兑现过的不会再被清掉' : '已恢复自动清理：完成满 15 天自动移除', 'info', 3000);
+      paintPromises(d);
+    });
+    const clr = card.querySelector('#pmClear');
+    if (clr) clr.addEventListener('click', async () => {
+      const n = (promiseState.items || []).filter(x => x.done).length;
+      await pmPost(pid, { op: 'clearDone' });
+      toast(`已清空 ${n} 条已兑现`, 'info', 2200);
+      paintPromises(d);
+    });
+  }
+
+  // 就地改文字：回车确认，Esc 放弃。改过的条目在后端打 edited 标记，重算分析不会再被覆盖
+  function startPmEdit(d, item, id) {
+    const span = item.querySelector('.pm-text');
+    if (!span || item.querySelector('.pm-edit-input')) return;
+    const cur = (promiseState.items || []).find(x => x.id === id);
+    const old = cur ? cur.text : span.textContent;
+    const inp = document.createElement('input');
+    inp.className = 'pm-edit-input';
+    inp.value = old;
+    span.replaceWith(inp);
+    inp.focus();
+    inp.select();
+    let settled = false;
+    const commit = async (save) => {
+      if (settled) return;
+      settled = true;
+      const t = (inp.value || '').trim();
+      if (save && t && t !== old) {
+        await pmPost(d.person.id, { op: 'update', id, text: t });
+        toast('已改好 · 之后重新分析不会被覆盖', 'info', 2600);
+      }
+      paintPromises(d);
+    };
+    inp.addEventListener('keydown', e => {
+      if (e.key === 'Enter') { e.preventDefault(); commit(true); }
+      if (e.key === 'Escape') { e.preventDefault(); commit(false); }
+    });
+    inp.addEventListener('blur', () => commit(true));
+  }
+
+  // ==================== 年度报告：折叠入口 + 全屏自动放映 ====================
+  // 节奏：3.8 秒太快来不及看，6.8 秒又太长，取中间值。每页 dur 是「原始权重」，
+  // 实际停留 = (本页 dur 或 RS_BASE) × RS_PACE —— 想整体调快调慢只动 RS_PACE 一个数。
+  // 转场：旧页淡出 + 新页淡入，两层短暂并存（容器绝对定位，不会互相挤位），不再一次性 innerHTML 硬切。
+  // 每页版式不同（封面 / 巨型数字 / 左右对照 / 排行 / 大字词 / 结尾），靠 .k-* 类切换。
+  const RS_PACE = .78, RS_BASE = 6800, RS_OUT = 560, RS_IDLE = 2200;
+  // 页数按「这份聊天记录撑得起多少内容」走，不再固定 12 页：最少 9 页，最多 15 页。
+  const RS_MIN = 9, RS_MAX = 15;
+  const rs = { slides: [], i: 0, timer: null, paused: false, ended: false, idle: null, aiBless: null, blessSeq: 0 };
+
+  const rsNum = v => Number(v || 0).toLocaleString();
+  // 光学字号只数数字位数：「6,633」按 4 位算，逗号不算。
+  const rsLen = s => Math.min(10, Math.max(1, String(s == null ? '' : s).replace(/\D/g, '').length || 1));
+  const rsTs = v => new Date(v > 1e12 ? v : (v || 0) * 1000);
+  // 年鉴式日期：2025.09.18。
+  // 原来写「2025 年 9 月 18 日」，中文一多整行又扁又长还爱折行；
+  // 点分写法短一半，配上衬线等宽数字排出来才像年鉴。
+  const rsDate = v => {
+    if (!v) return '';
+    const d2 = rsTs(v), p = n => String(n).padStart(2, '0');
+    return d2.getFullYear() + '.' + p(d2.getMonth() + 1) + '.' + p(d2.getDate());
+  };
+  // 秒 → {数量, 单位}。拆开是为了让单位单独成节点按基线对齐（混在一个节点里字号和基线都对不齐）。
+  const rsDur = sec => {
+    if (!sec) return { n: '—', u: '' };
+    if (sec < 60) return { n: String(Math.round(sec)), u: '秒' };
+    if (sec < 3600) return { n: String(Math.round(sec / 60)), u: '分钟' };
+    return { n: (sec / 3600).toFixed(1), u: '小时' };
+  };
+
+  // ---------- 结尾寄语：先由数据出「分析」，再给一段「祝福」 ----------
+  // 规则版是保底（打开就有、不依赖 AI）；AI 就绪时前台看到的是模型现写的那版。
+  // 每句都必须挂在真实数字上 —— 否则一封通用祝福信放在哪份报告里都一样，那就没意义了。
+  //
+  // 只留「一句分析 + 一句祝福」。试过三句：在 1500×960 下直接把印章和落款挤出屏幕了，
+  // 结尾页是收尾，不是把统计再念一遍。
+  function rsBless(d, r, items, done) {
+    const name = (d.person && d.person.name) || 'TA';
+    const g = {};
+    for (const x of (d.gauges || [])) g[x.key] = x.value;
+    const head = [];
+    // 按「最该被说出来」排序：先冷落，再主动度，最后才是细节
+    if (d.coldDays >= 7) head.push(`已经 ${d.coldDays} 天没说话了。距离从来不是问题，习惯沉默才是。`);
+    else if (d.coldDays >= 3) head.push(`有 ${d.coldDays} 天没联系了，别等一个"合适的时机"，一句话就够了。`);
+    else if (g.active >= 65) head.push(`这一年多数话头是你先开的（${rsNum(r.meStarts)} 次），肯先开口的人不多，别把这份主动磨没了。`);
+    else if (g.active <= 35) head.push(`这一年多数话头是${name}先开的，能被人惦记着、主动找你 ${rsNum(r.taStarts)} 次，挺难得的。`);
+    else head.push(`你开了 ${rsNum(r.meStarts)} 次话，${name} 开了 ${rsNum(r.taStarts)} 次，有来有回比一时的热烈更扛时间。`);
+
+    if (r.spanDays >= 300) head.push(`聊了 ${rsNum(r.spanDays)} 天，长跑最怕的不是争吵，是"理所当然"，记得偶尔说声谢谢。`);
+    else if (r.lateNightMsgs >= 80) head.push(`有 ${rsNum(r.lateNightMsgs)} 条消息发在 22 点以后，愿意在困的时候陪你说几句的人，要记着。`);
+    else if (items.length) {
+      const rest = items.length - done;
+      head.push(rest === 0
+        ? `记下的 ${items.length} 件事全做到了，说到做到的人，日子不会差。`
+        : `还有 ${rest} 件答应过的事在路上，不用急，一件一件来。`);
+    }
+
+    const tail = '愿你们说话一直不用斟酌措辞，也愿你想开口的时候，那头永远有人接得住。';
+    // 第一句分析（最重要那条）固定带上；后面那句只在还放得下时才加
+    let out = head[0] || '';
+    if (head[1] && out.length + head[1].length + tail.length <= 104) out += head[1];
+    return out + tail;
+  }
+
+  function reportEntry(d) {
+    const r = d.report || {};
+    return `<div class="report-entry" id="reportEntry" title="点开像放映一样自动翻页（全屏 · Esc 退出）">
+      <span class="re-rhombus"></span>
+      <span class="re-tt">年度报告</span>
+      <span class="re-sub">${r.spanDays || 0} 天 · ${(r.totalMsgs || 0).toLocaleString()} 条消息 · 自动放映</span>
+      <span class="re-play">▶</span>
+    </div>`;
+  }
+
+  // 页数：由「这份记录有多厚」决定，最少 RS_MIN 页、最多 RS_MAX 页。
+  // 固定 12 页的问题是两头都别扭：聊得少的被硬塞几页空数据，聊得多的又把好内容砍了。
+  function slideTarget(d) {
+    const r = d.report || {};
+    const items = (promiseState && promiseState.items) || [];
+    const likes = ((d.likes && d.likes.me) || []).length + ((d.likes && d.likes.ta) || []).length;
+    const is = r.imgStats || {};
+    // 六个侧面各算一分，加满 6：够不够厚，看的是「有没有东西可讲」，不是消息越多越好
+    const rich =
+      (r.totalMsgs >= 3000 ? 2 : r.totalMsgs >= 800 ? 1 : 0) +
+      (r.spanDays >= 300 ? 2 : r.spanDays >= 90 ? 1 : 0) +
+      (r.chatTimes >= 400 ? 2 : r.chatTimes >= 100 ? 1 : 0) +
+      (items.length ? 1 : 0) +
+      (likes >= 3 ? 1 : 0) +
+      ((is.emojiTotal || 0) >= 100 ? 1 : 0);
+    return Math.max(RS_MIN, Math.min(RS_MAX, RS_MIN + rich));
+  }
+
+  // 每页一条数据。数字都来自后端 report，不在这里现算，免得和别处口径不一致。
+  //
+  // 取舍规则：core 页任何记录都成立，永远保留；score 页按「这份数据够不够撑起它」打分，
+  // 目标页数装不下时就砍分最低的那几页。ord 只决定讲故事的顺序，不参与取舍
+  // —— 按分数重排会把叙事线打乱，报告就不像一个故事了。
+  function buildSlides(d, pm) {
+    const r = d.report || {};
+    const name = (d.person && d.person.name) || 'TA';
+    const items = (pm && pm.items) || [];
+    const done = items.filter(x => x.done).length;
+    const pct = (a, b) => (b ? Math.round(a / b * 100) : 0);
+    const pool = [];
+    const add = o => pool.push(o);
+
+    const y1 = rsTs(r.firstAt).getFullYear(), y2 = rsTs(r.lastAt).getFullYear();
+    add({ ord: 10, core: true, layout: 'cover',
+      year: y1 === y2 ? String(y1) : (y1 + ' — ' + y2),
+      rng: y1 !== y2,
+      big: name, sub: '与你的第 ' + rsNum(r.spanDays) + ' 天',
+      d1: rsDate(r.firstAt), d2: rsDate(r.lastAt), dur: 5800 });
+
+    add({ ord: 20, core: true, layout: 'num', kicker: '你们一共说了', num: rsNum(r.totalMsgs), unit: '条消息',
+      note: '平均每天 ' + (r.dailyMsg || 0).toFixed(1) + ' 条 · 一共聊了 ' + rsNum(r.chatTimes) + ' 次' });
+
+    // 最猛的一次：条数越大越值得单开一页
+    if (r.maxSegN) add({ ord: 30, score: 3 + Math.min(5, (r.maxSegN || 0) / 20), layout: 'num',
+      kicker: '最猛的一次', num: rsNum(r.maxSegN), unit: '条消息',
+      note: rsDate(r.maxSegAt) + ' 那天，一口气聊到停不下来', dur: 7600 });
+
+    const starts = (r.meStarts || 0) + (r.taStarts || 0);
+    add({ ord: 40, core: true, layout: 'split', kicker: '谁先开口', dur: 6600,
+      pair: [
+        { k: name + '先找你', v: r.taStarts || 0, p: '占 ' + pct(r.taStarts || 0, starts) + '%', dim: (r.taStarts || 0) < (r.meStarts || 0) },
+        { k: '你先找 ' + name, v: r.meStarts || 0, p: '占 ' + pct(r.meStarts || 0, starts) + '%', dim: (r.meStarts || 0) < (r.taStarts || 0) },
+      ],
+      bar: pct(r.taStarts || 0, starts),
+      note: starts ? '一共开了 ' + rsNum(starts) + ' 次话头 · 热火朝天 ' + rsNum(r.hotSegs) + ' 次' : '' });
+
+    // 谁话更多：两边都没说话的记录没得比
+    const meN = r.meMsgs || 0, taN = r.taMsgs || 0;
+    if (meN && taN) add({ ord: 50, score: 2 + Math.min(4, Math.min(meN, taN) / 250), layout: 'bars',
+      kicker: '谁说得更多', dur: 6400,
+      bars: [
+        { k: '你', v: meN, w: pct(meN, meN + taN) },
+        { k: name, v: taN, w: pct(taN, meN + taN), g: 'ta' },
+      ],
+      note: meN === taN ? '一模一样多，这默契有点东西'
+        : ((meN > taN ? '你' : name) + '多说了 ' + rsNum(Math.abs(meN - taN)) + ' 条') });
+
+    if (r.lateNightMsgs) add({ ord: 60, score: 2 + Math.min(4, (r.lateNightMsgs || 0) / 40), layout: 'num',
+      kicker: '深夜时段', num: rsNum(r.lateNightMsgs), unit: '条消息发在 22 点后',
+      note: '深夜开始聊的有 ' + rsNum(r.lateSegs) + ' 次' });
+
+    // 深夜是谁在熬：只有两边都沾过深夜才值得对照
+    if (r.meLate && r.taLate) add({ ord: 70, score: 2 + Math.min(3, Math.min(r.meLate, r.taLate) / 12), layout: 'split',
+      kicker: '谁在熬夜陪你', dur: 6400,
+      pair: [
+        { k: '你发的深夜消息', v: rsNum(r.meLate), p: '22 点以后' },
+        { k: name + '发的深夜消息', v: rsNum(r.taLate), p: '22 点以后', dim: (r.taLate || 0) < (r.meLate || 0) },
+      ],
+      bar: pct(r.taLate || 0, (r.meLate || 0) + (r.taLate || 0)),
+      note: (r.taLate || 0) > (r.meLate || 0)
+        ? (name + ' 比你更能熬，夜里的那点心事多半是 TA 先开的口')
+        : '深夜的对话框里多半是你先冒的头' });
+
+    add({ ord: 80, core: true, layout: 'split', kicker: '回消息的速度', dur: 6600,
+      pair: [
+        { k: name + '回你的中位数', v: fmtDur(r.taMidReply), p: '平时大概这么久' },
+        { k: '你回 ' + name, v: fmtDur(r.meMidReply), p: '平时大概这么久', dim: true },
+      ], note: '中位数比平均值更贴近体感，偶尔一条隔夜消息不会带偏它' });
+
+    // 最快的一次：只有真的很快（≤60 秒）才值得拿来说
+    if (r.taFastest && r.taFastest <= 60) add({ ord: 90, score: 2 + (r.taFastest <= 5 ? 3 : 0), layout: 'num',
+      kicker: name + '回得最快的一次', num: rsDur(r.taFastest).n, unit: rsDur(r.taFastest).u + '就回了你',
+      note: '最快的那一下，几乎是你刚发完', dur: 6400 });
+
+    add({ ord: 100, core: true, layout: 'num', kicker: '最长的一段连续', num: rsNum(r.maxStreak), unit: '天，天天都说了话',
+      note: r.maxSilence ? ('中间断得最久的一次是 ' + r.maxSilence + ' 天') : '一次都没断过' });
+
+    if (r.maxSilence >= 5) add({ ord: 110, score: 1 + Math.min(4, r.maxSilence / 15), layout: 'num',
+      kicker: '断得最久的一次', num: rsNum(r.maxSilence), unit: '天没说话',
+      note: '再长的沉默也接上了，这本身就算数', dur: 6400 });
+
+    if (items.length) add({ ord: 120, score: 4 + Math.min(3, items.length / 4), layout: 'bars', kicker: '说好的事', dur: 6800,
+      bars: [
+        { k: '已兑现', v: done, w: pct(done, items.length) },
+        { k: '还在路上', v: items.length - done, w: 100 - pct(done, items.length) },
+      ],
+      note: '一共记下 ' + items.length + ' 条 · ' + (done === items.length ? '全都做到了' : '慢慢来，别催') });
+
+    const wm = ((d.topWords && d.topWords.me) || []).slice(0, 3);
+    const wt = ((d.topWords && d.topWords.ta) || []).slice(0, 3);
+    if (wm.length || wt.length) add({ ord: 130, score: 4 + Math.min(3, (wm.length + wt.length) / 2), layout: 'bars',
+      kicker: '说得最多的词', dur: 7200,
+      bars: [...wm.map(x => ({ k: '你 · ' + x.w, v: x.n, w: 0, g: 'me' })),
+             ...wt.map(x => ({ k: name + ' · ' + x.w, v: x.n, w: 0, g: 'ta' }))],
+      max: Math.max(1, ...[...wm, ...wt].map(x => x.n)),
+      note: '把两个人一整年的话压成几个词，大致就长这样' });
+
+    if (wm[0]) add({ ord: 140, score: 3, layout: 'word', kicker: '你最爱说的', big: wm[0].w, dur: 6800,
+      note: '你：' + (wm.map(x => x.w).join(' · ') || '—') + '　' + name + '：' + (wt.map(x => x.w).join(' · ') || '—') });
+
+    const lk = [...((d.likes && d.likes.me) || []), ...((d.likes && d.likes.ta) || [])].slice(0, 4).map(x => x.text);
+    if (lk.length) add({ ord: 150, score: 3 + Math.min(3, lk.length), layout: 'word', kicker: '你们都提过',
+      big: lk[0], dur: 6800, note: lk.join(' · ') });
+
+    // 图与表情：只有发得够多才有单独一页的价值
+    const is = r.imgStats || {};
+    if ((is.emojiTotal || 0) >= 30 || (is.total || 0) >= 10) add({ ord: 160, score: 2 + Math.min(4, (is.emojiTotal || 0) / 60), layout: 'bars',
+      kicker: '不靠文字的那些话', dur: 6400,
+      bars: [
+        { k: '你发表情', v: is.meEmoji || 0, w: 0 },
+        { k: name + '发表情', v: is.taEmoji || 0, w: 0, g: 'ta' },
+        { k: '你发图片', v: is.meImg || 0, w: 0 },
+        { k: name + '发图片', v: is.taImg || 0, w: 0, g: 'ta' },
+      ],
+      note: '一共 ' + rsNum((is.emojiTotal || 0) + (is.total || 0)) + ' 个表情和图片，都算在聊天的份量里' });
+
+    if (d.nextAnniversary) add({ ord: 170, score: 3, layout: 'num', kicker: '下一件要记住的事',
+      num: rsNum(d.nextAnniversary.days), unit: '天后 · ' + d.nextAnniversary.label,
+      note: d.nextAnniversary.date, dur: 6200 });
+
+    // 结尾页：分数 → 分析 → 寄语 → 落款。core，永远最后。
+    const love = (d.gauges || []).find(g => g.key === 'loved');
+    add({ ord: 999, core: true, layout: 'end', kicker: '这一年',
+      num: love ? rsNum(love.value) : '—', unit: '分',
+      note: d.coldDays >= 3 ? ('不过已经 ' + d.coldDays + ' 天没联系了') : '是被爱的程度 · 还在继续',
+      bless: rsBless(d, r, items, done),
+      sign: (y1 === y2 ? String(y1) : y1 + '—' + y2) + ' · 相拥',
+      dur: 11000 });
+
+    // 装不下就砍 score 最低的（core 页一页不砍），最后按 ord 还原叙事顺序
+    const target = slideTarget(d);
+    const core = pool.filter(s => s.core);
+    const opt = pool.filter(s => !s.core).sort((a, b) => b.score - a.score);
+    const room = Math.max(0, target - core.length);
+    const keep = new Set(core.concat(opt.slice(0, room)));
+    return pool.filter(s => keep.has(s)).sort((a, b) => a.ord - b.ord);
+  }
+
+  // ---------- 每页的 DOM（版式在这里分叉） ----------
+  function pageHtml(s) {
+    const kick = s.kicker ? `<div class="rs-kicker up" style="--i:0">${esc(s.kicker)}</div>` : '';
+    const note = s.note ? `<div class="rs-note up" style="--i:3">${esc(s.note)}</div>` : '';
+    const UP = (i) => `class="up" style="--i:${i}"`;
+
+    if (s.layout === 'cover') {
+      // 日期拆两段 + 中间一条横线：单个长中文串又扁又小还爱折行，点分写法才像年鉴
+      const date = (s.d1 || s.d2)
+        ? `<div class="cv-date up" style="--i:4"><span>${esc(s.d1 || '')}</span><i class="dash"></i><span>${esc(s.d2 || '')}</span></div>`
+        : '';
+      return `<div class="cv-year${s.rng ? ' rng' : ''} up" style="--i:0">${esc(s.year)}</div>
+        <div class="cv-name up" style="--i:1">${esc(s.big)}</div>
+        <div class="cv-sub up" style="--i:2">${esc(s.sub || '')}</div>
+        <div class="cv-hr up" style="--i:3"></div>
+        ${date}`;
+    }
+    if (s.layout === 'num' || s.layout === 'end') {
+      const seal = s.layout === 'end' ? '<div class="end-seal up" style="--i:4"></div>' : '';
+      // 结尾页：分数之后接「分析 + 寄语 + 落款」，这一页是整份报告真正的收尾
+      const bless = s.layout === 'end'
+        ? `<div class="rs-bless up" id="rsBless" style="--i:4">${esc(s.bless || '')}</div>`
+        : '';
+      const sign = s.layout === 'end'
+        ? `<div class="rs-sign up" style="--i:5">${esc(s.sign || '')}</div>`
+        : '';
+      return `${kick}
+        <div class="rs-numrow up" data-len="${rsLen(s.num)}" style="--i:1">
+          <span class="rs-num">${esc(s.num)}</span><span class="rs-unit">${esc(s.unit || '')}</span>
+        </div>
+        <div class="rs-under up" style="--i:2"></div>${note}${bless}${seal}${sign}`;
+    }
+    if (s.layout === 'split') {
+      const col = (c, i) => `<div class="sp-col${c.dim ? ' dim' : ''}">
+          <div class="sp-k up" style="--i:${i}">${esc(c.k)}</div>
+          <div class="sp-v up" style="--i:${i + 1}">${esc(String(c.v))}</div>
+          <div class="sp-p up" style="--i:${i + 2}">${esc(c.p || '')}</div>
+        </div>`;
+      const b = s.bar == null ? '' :
+        `<div class="sp-track up" style="--i:2"><i style="width:${s.bar}%"></i><i class="r" style="width:${100 - s.bar}%"></i></div>`;
+      return `${kick}
+        <div class="rs-split up" style="--i:1">${col(s.pair[0], 1)}<div class="sp-mid"></div>${col(s.pair[1], 2)}</div>
+        ${b}${note}`;
+    }
+    if (s.layout === 'bars') {
+      const max = s.max || Math.max(1, ...s.bars.map(x => x.v));
+      const rows = s.bars.map(x => `<div class="b-row${x.g === 'ta' ? ' ta' : ''}">
+          <span class="b-k" title="${esc(x.k)}">${esc(x.k)}</span>
+          <div class="b-track"><i style="width:${x.w != null && x.w > 0 ? x.w : Math.max(3, Math.round(x.v / max * 100))}%"></i></div>
+          <span class="b-v">${esc(rsNum(x.v))}</span>
+        </div>`).join('');
+      return `${kick}<div class="rs-bars up" style="--i:1">${rows}</div>${note}`;
+    }
+    if (s.layout === 'word') {
+      return `${kick}<div class="rs-word up" style="--i:1">${esc(s.big)}</div>
+        <div class="rs-side up" style="--i:2">${esc(s.note || '')}</div>`;
+    }
+    return `${kick}<div class="rs-note up" style="--i:1">${esc(s.big || '')}</div>`;
+  }
+
+  // ---------- 装饰层：靠 CSS 变量在页间平滑位移，形成「元素联动」 ----------
+  // 用索引推位移而不是写死一张表：页号一走，菱形/光晕/刻度线就连续地游过去。
+  // 幅度刻意收得小（±5vw/±4vh）：漂太远会被视口边缘裁掉，菱形只剩一条斜边，看着像脏块。
+  function rsDeco(dir) {
+    const st = document.getElementById('reportStage');
+    if (!st) return;
+    st.style.setProperty('--rs-dx', (Math.sin(rs.i * 0.7) * 5).toFixed(1) + 'vw');
+    st.style.setProperty('--rs-dy', (Math.cos(rs.i * 0.9) * 4).toFixed(1) + 'vh');
+    st.style.setProperty('--rs-rot', (Math.sin(rs.i * 1.1) * 26).toFixed(0) + 'deg');
+    st.style.setProperty('--rs-sc', (0.9 + Math.abs(Math.sin(rs.i * 1.3)) * 0.24).toFixed(2));
+    rsOrd(dir);
+  }
+
+  // 背景那个大页码：换页时要「翻过去」，不是直接换个字。
+  // 原来只写 textContent，数字硬切；而且没有 lnum，用的是老式数字（6/8 高一半）。
+  // 现在：按位数分档 + 用 translate 属性做一次自下（或自上）的进出。
+  // 重启 CSS 动画必须把 animation 清空再强制回流，否则浏览器把它合批，什么都不会发生。
+  function rsOrd(dir) {
+    const st = document.getElementById('reportStage');
+    const ord = st && st.querySelector('.d-ord');
+    if (!ord) return;
+    const txt = String(rs.i + 1).padStart(2, '0');
+    ord.dataset.len = String(txt.replace(/\D/g, '').length);
+    st.style.setProperty('--ord-dir', dir < 0 ? '-1' : '1');
+    if (ord.textContent === txt) return;
+    ord.textContent = txt;
+    ord.style.animation = 'none';
+    void ord.offsetWidth;
+    ord.style.animation = '';
+  }
+
+  // 上一页的数字留在角落当残影滑走。这是最直白的一处页间联动。
+  function rsGhost(text) {
+    const g = document.querySelector('#reportStage .d-ghost');
+    if (!g || !text) return;
+    g.textContent = String(text);
+    g.dataset.len = String(rsLen(text));
+    g.style.transition = 'none';
+    g.style.setProperty('--gh-x', '0px');
+    g.style.setProperty('--gh-y', '0px');
+    g.style.setProperty('--gh-o', '.5');
+    void g.offsetWidth;                    // 强制回流，否则下面改回去时浏览器会合并成一次，看不到起点
+    g.style.transition = '';
+    requestAnimationFrame(() => {
+      g.style.setProperty('--gh-x', '-54px');
+      g.style.setProperty('--gh-y', '-36px');
+      g.style.setProperty('--gh-o', '0');
+    });
+  }
+
+  function rsBar() {
+    const i = document.querySelector('#reportStage .rs-bar i');
+    if (i) i.style.width = ((rs.i + 1) / rs.slides.length * 100) + '%';
+  }
+
+  // 页码 + 圆点轨道：都塞在 .rs-pager 里，那个盒子默认 max-width:0，鼠标移上控制条才展开。
+  function rsPager() {
+    const st = document.getElementById('reportStage');
+    if (!st) return;
+    const idx = st.querySelector('.rs-idx'), dots = st.querySelector('.rs-dots');
+    if (idx) idx.textContent = (rs.i + 1) + ' / ' + rs.slides.length;
+    if (!dots) return;
+    if (dots.children.length !== rs.slides.length) {
+      dots.innerHTML = rs.slides.map((_, k) => `<span class="rs-dot" data-k="${k}"></span>`).join('');
+      dots.querySelectorAll('.rs-dot').forEach(el => el.addEventListener('click', () => rsGo(+el.dataset.k, +el.dataset.k > rs.i ? 1 : -1)));
+    }
+    [...dots.children].forEach((el, k) => el.classList.toggle('on', k === rs.i));
+  }
+
+  function rsArm() {
+    clearTimeout(rs.timer);
+    if (rs.paused || rs.ended) return;
+    const s = rs.slides[rs.i] || {};
+    rs.timer = setTimeout(() => {
+      // 最后一页不再直接关掉（突然没了像程序崩了）→ 停在结尾态给提示，等手动退出或重播
+      if (rs.i + 1 >= rs.slides.length) return rsDone(true);
+      rsGo(rs.i + 1, 1);
+    }, Math.round((s.dur || RS_BASE) * RS_PACE));
+  }
+
+  // 放映结束态。提示条和控制条态都挂在 stage 上，靠 CSS 切，不用额外建/删元素。
+  function rsDone(on) {
+    rs.ended = !!on;
+    // 自动放映走到结尾就把音乐收掉 —— 人都停在「放映结束」的提示上了，
+    // 背景还在自顾自弹下去会很怪
+    if (rs.ended) { stopMusic(); sfx('end'); }
+    const st = document.getElementById('reportStage');
+    if (st) st.classList.toggle('ended', rs.ended);
+    rsPlayBtn();
+  }
+  // 播放键三种态：暂停 ▶ / 播放中 ❚❚ / 已结束 ↻
+  function rsPlayBtn() {
+    const b = document.querySelector('#reportStage #rsPlay');
+    if (!b) return;
+    b.textContent = rs.ended ? '↻' : (rs.paused ? '▶' : '❚❚');
+    b.title = rs.ended ? '重播（空格）' : '暂停 / 继续（空格）';
+  }
+  // 背景音乐开关的态。关掉时加 .off（CSS 里划一道斜线），一眼看得出没在放
+  function rsMusicBtn() {
+    const b = document.querySelector('#reportStage #rsMusic');
+    if (!b) return;
+    const on = !!(window.SOUND && window.SOUND.musicOn);
+    b.classList.toggle('off', !on);
+    b.title = on ? '背景音乐：开（点击关闭）' : '背景音乐：关（点击打开）';
+  }
+
+  // 鼠标停住 RS_IDLE 毫秒就把控制条收干净。只靠 :hover 不行——stage 铺满整屏，
+  // 鼠标在窗口里任何位置都算 hover，等于一直显示，所以才"藏不起来"。
+  function rsWake() {
+    const st = document.getElementById('reportStage');
+    if (st) st.classList.remove('idle');
+    clearTimeout(rs.idle);
+    rs.idle = setTimeout(() => {
+      if (st && st.classList.contains('on')) st.classList.add('idle');
+    }, RS_IDLE);
+  }
+
+  // dir=1 下一句，-1 上一句；只用来决定装饰和残影往哪边走
+  function rsGo(i, dir) {
+    const st = document.getElementById('reportStage');
+    const box = st && st.querySelector('.rs-slides');
+    if (!box || !rs.slides.length) return;
+    const prevNum = (rs.slides[rs.i] || {}).num;   // 赋值前取，才是「上一页」
+    const old = box.querySelector('.rs-slide:not(.leaving)');
+    if (old) {
+      old.classList.add('leaving');
+      setTimeout(() => old.remove(), RS_OUT + 80);
+      sfx('page');    // 只有真的从上一页翻过来才响；开场那次 rsGo 不算翻页
+    }
+    rs.i = Math.max(0, Math.min(rs.slides.length - 1, i));
+    const s = rs.slides[rs.i] || {};
+    const el = document.createElement('section');
+    el.className = 'rs-slide k-' + (s.layout || 'num');
+    el.innerHTML = pageHtml(s);
+    box.appendChild(el);
+    rsDeco(dir);
+    if (dir > 0 && rs.i > 0) rsGhost(prevNum);
+    rsBar();
+    rsPager();
+    rsDone(false);   // 手动翻页就退出「已结束」态
+    // 走到结尾页时，如果模型版寄语已经回来了就补上去（没回来就用规则版，绝不空着）
+    if (s.layout === 'end') applyAiBless();
+    // 这里**故意不叫 rsWake()**：自动翻页每 5 秒一次，一 wake 就等于控制条连着页码
+    // 每页闪一下。控制条只该被人自己的操作唤醒（openReport / mousemove / keydown）。
+    rsArm();
+  }
+
+  // ---------- 结尾寄语的 AI 版：后台先要，不挡放映 ----------
+  // 报告是自动翻页的，绝不能为了等模型把幻灯片卡住；
+  // 所以这里只管「提前下单」，回来得早就换上，回来得晚就当没这回事。
+  function rsBlessAi(d, seq) {
+    if (!aiState.ready || d.group) return;
+    fetch('/api/ai/blessing', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ d }) })
+      .then(async (r) => {
+        const j = await r.json().catch(() => ({}));
+        if (seq !== rs.blessSeq || !r.ok || !j || !j.ok || !j.blessing) return;
+        rs.aiBless = j.blessing;
+        applyAiBless();   // 人可能已经翻到结尾页了，直接补上去
+      }).catch(() => { /* 失败就继续用规则版，不打扰用户 */ });
+  }
+
+  function applyAiBless() {
+    const el = document.getElementById('rsBless');
+    if (!el || !rs.aiBless || el.classList.contains('ai-made')) return;
+    el.classList.add('ai-made');
+    el.innerHTML = esc(rs.aiBless) + '<span class="ai-tag">AI 现写</span>';
+  }
+
+  function openReport(d) {
+    rs.slides = buildSlides(d, promiseState);
+    rs.i = 0;
+    rs.paused = false;
+    rs.ended = false;
+    let st = document.getElementById('reportStage');
+    if (!st) {
+      st = document.createElement('div');
+      st.id = 'reportStage';
+      document.body.appendChild(st);
+    }
+    st.className = 'report-stage';
+    st.innerHTML = `<div class="rs-deco">
+        <div class="d-grid"></div><div class="d-noise"></div><div class="d-glow"></div>
+        <div class="d-ring"></div><div class="d-mark"></div><div class="d-rule"></div>
+        <div class="d-ord"></div><div class="d-ghost"></div>
+        <div class="d-corner tl"></div><div class="d-corner tr"></div>
+        <div class="d-corner bl"></div><div class="d-corner br"></div>
+      </div>
+      <div class="rs-slides"></div>
+      <div class="rs-bar"><i></i></div>
+      <div class="rs-done">放映结束 · 点 <b>↻</b> 再看一遍，或按 <b>Esc</b> 退出</div>
+      <div class="rs-ctrl">
+        <button class="rs-btn" id="rsPrev" title="上一页（←）" data-sfx="none">‹</button>
+        <button class="rs-btn rs-play" id="rsPlay" title="暂停 / 继续（空格）">❚❚</button>
+        <button class="rs-btn" id="rsNext" title="下一页（→）" data-sfx="none">›</button>
+        <button class="rs-btn rs-music" id="rsMusic" title="背景音乐" data-sfx="none">♪</button>
+        <div class="rs-pager"><span class="rs-idx"></span><div class="rs-dots"></div></div>
+        <button class="rs-btn rs-close" id="rsClose" title="退出（Esc）" data-sfx="none">✕</button>
+      </div>`;
+    const q = (id) => st.querySelector(id);
+    q('#rsPrev').addEventListener('click', () => rsGo(rs.i - 1, -1));
+    q('#rsNext').addEventListener('click', () => (rs.i + 1 >= rs.slides.length ? closeReport() : rsGo(rs.i + 1, 1)));
+    q('#rsPlay').addEventListener('click', () => {
+      if (rs.ended) { rs.paused = false; startMusic(); return rsGo(0, 1); }   // 结束态下就是重播
+      rs.paused = !rs.paused;
+      rsPlayBtn();
+      if (rs.paused) { clearTimeout(rs.timer); stopMusic(); } else { rsArm(); startMusic(); }
+    });
+    q('#rsClose').addEventListener('click', closeReport);
+    // 报告里就地关音乐 —— 不想听了不该还得退出去翻设置
+    q('#rsMusic').addEventListener('click', () => {
+      const on = !(window.SOUND && window.SOUND.musicOn);
+      try { if (window.SOUND) window.SOUND.setMusic(on); } catch (e) {}
+      if (on) startMusic(); else stopMusic();
+      rsMusicBtn();
+    });
+    // 鼠标动、或者点一下（bubbles 到 stage），都算「人还在」，把控制条亮回来
+    st.addEventListener('mousemove', rsWake);
+    st.addEventListener('click', rsWake);
+    rsMusicBtn();       // 按当前设置初始化音乐键的态
+    document.body.classList.add('report-lock');
+    // 显示用的是 rAF：等一帧再上 .on，入场过渡才走得出来。
+    // 但 rAF 在**窗口被遮挡 / 最小化**时会停摆（离屏截图的窗口里就是这样），
+    // 那样报告会「打开了却一直不显示」。补一个定时器兜底，顺带让自动化测试变确定。
+    // 用 token 而不是 clearTimeout：rAF 和定时器两条路都要能作废，
+    // 否则刚 closeReport、迟到的 show() 又把 .on 加回来，报告就"关不干净"。
+    rs.openToken = (rs.openToken || 0) + 1;
+    const tok = rs.openToken;
+    const show = () => { if (rs.openToken === tok) st.classList.add('on'); };
+    requestAnimationFrame(show);
+    setTimeout(show, 140);
+    rsWake();
+    startMusic();        // 背景音乐从 0 淡入（约 2.4 秒），不抢开场那声铃
+    sfx('start');
+    rsGo(0, 1);
+    rsBlessAi(d, seq);   // 后台先要一段结尾寄语，不等它
+  }
+
+  function closeReport() {
+    clearTimeout(rs.timer);
+    clearTimeout(rs.idle);
+    rs.openToken = (rs.openToken || 0) + 1;   // 作废还没跑的 show()，别让它把 .on 加回来
+    stopMusic();          // 音乐 1.6 秒淡出，别硬切
+    sfx('end');
+    const st = document.getElementById('reportStage');
+    if (st) {
+      st.classList.remove('on');
+      setTimeout(() => { if (!st.classList.contains('on')) st.innerHTML = ''; }, 460);
+    }
+    document.body.classList.remove('report-lock');
+  }
+
+  function bindReportKeys() {
+    if (window.__reportKeys) return;
+    window.__reportKeys = true;
+    document.addEventListener('keydown', e => {
+      const st = document.getElementById('reportStage');
+      if (!st || !st.classList.contains('on')) return;
+      const last = rs.i + 1 >= rs.slides.length;
+      rsWake();   // 敲键也算人还在，控制条该亮
+      if (e.key === 'Escape') { e.preventDefault(); closeReport(); }
+      else if (e.key === 'ArrowRight') { e.preventDefault(); last ? closeReport() : rsGo(rs.i + 1, 1); }
+      else if (e.key === 'ArrowLeft') { e.preventDefault(); rsGo(rs.i - 1, -1); }
+      else if (e.key === ' ') {
+        e.preventDefault();
+        if (rs.ended) { rs.paused = false; startMusic(); return rsGo(0, 1); }
+        rs.paused = !rs.paused;
+        rsPlayBtn();
+        if (rs.paused) { clearTimeout(rs.timer); stopMusic(); } else { rsArm(); startMusic(); }
+      }
+    });
+  }
+
+  function bindReportEntry(d) {
+    const el = $('#reportEntry');
+    if (!el) return;
+    el.addEventListener('click', () => { bindReportKeys(); openReport(d); });
+  }
+
   // ---------- 交互绑定 ----------
   function bindMain(d) {
     const pid = d.person.id;
@@ -796,94 +1932,89 @@
       startInlineEdit(item, item.dataset._id, item.dataset.full || '');
     }));
     // 喜好：添加
-    main.querySelectorAll('.lk-add[data-side]').forEach(b => b.addEventListener('click', () => {
+    main.querySelectorAll('.lk-add[data-side]').forEach(b => b.addEventListener('click', async () => {
       const side = b.dataset.side;
-      const val = prompt(`添加${side === 'me' ? '我' : 'TA'}的喜好，例如：吃火锅、看科幻片`);
-      if (!val) return;
-      const text = val.trim();
+      const text = await askText(`添加${side === 'me' ? '我' : 'TA'}的喜好`, '', '例如：吃火锅、看科幻片');
       if (!text) return;
       fetch('/api/person/' + pid + '/likes', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'add', item: { side, text } })
-      }).then(r => { if (!r.ok) { alert('保存失败'); return; } selectPerson(pid); });
+      }).then(r => { if (!r.ok) { toast('保存失败', 'err'); return; } selectPerson(pid); });
     }));
     // 喜好：编辑 / 删除（事件委托）
     main.querySelectorAll('.lk-tag').forEach(tag => {
-      tag.querySelector('.lk-edit').addEventListener('click', e => {
+      tag.querySelector('.lk-edit').addEventListener('click', async e => {
         e.stopPropagation();
-        const val = prompt('编辑喜好内容：', tag.dataset.text);
-        if (!val) return;
-        const text = val.trim();
+        const text = await askText('编辑喜好内容', tag.dataset.text);
         if (!text) return;
         fetch('/api/person/' + pid + '/likes', {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ action: 'edit', item: { id: tag.dataset.id, side: tag.dataset.side, text } })
-        }).then(r => { if (!r.ok) { alert('保存失败'); return; } selectPerson(pid); });
+        }).then(r => { if (!r.ok) { toast('保存失败', 'err'); return; } selectPerson(pid); });
       });
-      tag.querySelector('.lk-del').addEventListener('click', e => {
+      tag.querySelector('.lk-del').addEventListener('click', async e => {
         e.stopPropagation();
-        if (!confirm(`删除喜好「${tag.dataset.text}」？`)) return;
+        const yes = await askOk(`删除喜好「${tag.dataset.text}」？`, '删掉后这条不会再被自动识别补回来。', { okText: '删除', danger: true });
+        if (!yes) return;
         fetch('/api/person/' + pid + '/likes', {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ action: 'del', item: { id: tag.dataset.id, side: tag.dataset.side } })
-        }).then(r => { if (!r.ok) { alert('删除失败'); return; } selectPerson(pid); });
+        }).then(r => { if (!r.ok) { toast('删除失败', 'err'); return; } selectPerson(pid); });
       });
     });
     // 纪念日：添加
     const addAnniv = main.querySelector('#addAnniv');
-    if (addAnniv) addAnniv.addEventListener('click', () => {
-      const label = prompt('纪念日名称（例如：在一起、生日）：', '纪念日');
+    if (addAnniv) addAnniv.addEventListener('click', async () => {
+      const label = await askText('纪念日名称', '', '例如：在一起、生日');
       if (!label) return;
-      const val = prompt('日期（格式 YYYY-MM-DD 或 MM-DD，例如 2024-08-15）：');
-      if (!val) return;
-      const date = val.trim();
-      if (!/^(\d{4}-)?\d{2}-\d{2}$/.test(date)) { alert('日期格式应为 YYYY-MM-DD 或 MM-DD'); return; }
+      const date = await askText('日期', '', '格式 YYYY-MM-DD 或 MM-DD，例如 2024-08-15');
+      if (!date) return;
+      if (!/^(\d{4}-)?\d{2}-\d{2}$/.test(date)) { toast('日期格式应为 YYYY-MM-DD 或 MM-DD', 'warn', 4000); return; }
       fetch('/api/person/' + pid + '/anniversaries', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'add', item: { label, date } })
-      }).then(r => { if (!r.ok) { alert('保存失败'); return; } selectPerson(pid); });
+      }).then(r => { if (!r.ok) { toast('保存失败', 'err'); return; } selectPerson(pid); });
     });
     // 纪念日：编辑 / 删除
     main.querySelectorAll('.anv').forEach(anv => {
       // 点击日期：仅修改时间
-      anv.querySelector('.anv-date').addEventListener('click', e => {
+      anv.querySelector('.anv-date').addEventListener('click', async e => {
         e.stopPropagation();
-        const val = prompt('修改日期（YYYY-MM-DD 或 MM-DD）：', anv.dataset.date);
-        if (!val) return;
-        const date = val.trim();
-        if (!/^(\d{4}-)?\d{2}-\d{2}$/.test(date)) { alert('日期格式应为 YYYY-MM-DD 或 MM-DD'); return; }
+        const date = await askText('修改日期', anv.dataset.date, '格式 YYYY-MM-DD 或 MM-DD');
+        if (!date) return;
+        if (!/^(\d{4}-)?\d{2}-\d{2}$/.test(date)) { toast('日期格式应为 YYYY-MM-DD 或 MM-DD', 'warn', 4000); return; }
         fetch('/api/person/' + pid + '/anniversaries', {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ action: 'edit', item: { id: anv.dataset.id, label: anv.dataset.label, date } })
-        }).then(r => { if (!r.ok) { alert('保存失败'); return; } selectPerson(pid); });
+        }).then(r => { if (!r.ok) { toast('保存失败', 'err'); return; } selectPerson(pid); });
       });
-      anv.querySelector('.lk-edit').addEventListener('click', e => {
+      anv.querySelector('.lk-edit').addEventListener('click', async e => {
         e.stopPropagation();
-        const label = prompt('纪念日名称：', anv.dataset.label);
+        const label = await askText('纪念日名称', anv.dataset.label);
         if (!label) return;
-        const val = prompt('日期（YYYY-MM-DD 或 MM-DD）：', anv.dataset.date);
-        if (!val) return;
-        const date = val.trim();
-        if (!/^(\d{4}-)?\d{2}-\d{2}$/.test(date)) { alert('日期格式应为 YYYY-MM-DD 或 MM-DD'); return; }
+        const date = await askText('日期', anv.dataset.date, '格式 YYYY-MM-DD 或 MM-DD');
+        if (!date) return;
+        if (!/^(\d{4}-)?\d{2}-\d{2}$/.test(date)) { toast('日期格式应为 YYYY-MM-DD 或 MM-DD', 'warn', 4000); return; }
         fetch('/api/person/' + pid + '/anniversaries', {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ action: 'edit', item: { id: anv.dataset.id, label, date } })
-        }).then(r => { if (!r.ok) { alert('保存失败'); return; } selectPerson(pid); });
+        }).then(r => { if (!r.ok) { toast('保存失败', 'err'); return; } selectPerson(pid); });
       });
-      anv.querySelector('.lk-del').addEventListener('click', e => {
+      anv.querySelector('.lk-del').addEventListener('click', async e => {
         e.stopPropagation();
-        if (!confirm(`删除纪念日「${anv.dataset.label} · ${anv.dataset.date}」？`)) return;
+        const yes = await askOk(`删除纪念日「${anv.dataset.label} · ${anv.dataset.date}」？`, '删除后不再计入倒计时。', { okText: '删除', danger: true });
+        if (!yes) return;
         fetch('/api/person/' + pid + '/anniversaries', {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ action: 'del', item: { id: anv.dataset.id } })
-        }).then(r => { if (!r.ok) { alert('删除失败'); return; } selectPerson(pid); });
+        }).then(r => { if (!r.ok) { toast('删除失败', 'err'); return; } selectPerson(pid); });
       });
     });
     main.querySelectorAll('.tog').forEach(t => t.addEventListener('click', () => {
@@ -1102,6 +2233,7 @@
       const render = () => {
         const curTheme = document.documentElement.getAttribute('data-theme') || 'blue';
         let grassOn = false; try { grassOn = localStorage.getItem('ta_love_grass') === '1'; } catch (e) {}
+        const sndCfg = (window.SOUND && window.SOUND.cfg()) || { on: true, music: true, vol: 1 };
         // 彩蛋仅在绿色主题下出现（不直白提示，当隐藏彩蛋）
         const easterSection = curTheme === 'green'
           ? `<div><div class="sp-sec">小彩蛋</div>
@@ -1123,6 +2255,17 @@
             <div class="sp-hint">剪贴板导入时，昵称等于此项的消息记为「我」，其余记为「TA」。</div>
             <input id="spMyNick" class="m-inp" type="text" value="${esc(settings.myNick || '')}" placeholder="例如：那抹煋铖">
           </div>
+          <div><div class="sp-sec">声音</div>
+            <label class="sp-opt"><input type="checkbox" id="spSfx" ${sndCfg.on ? 'checked' : ''}> 界面音效</label>
+            <label class="sp-opt"><input type="checkbox" id="spBgm" ${sndCfg.music ? 'checked' : ''} ${sndCfg.on ? '' : 'disabled'}> 年度报告背景音乐</label>
+            <div class="sp-vol">
+              <span class="sp-vol-lb">响度</span>
+              <input type="range" id="spVol" min="0" max="2" step="0.1" value="${sndCfg.vol}" ${sndCfg.on ? '' : 'disabled'}>
+              <span class="sp-vol-v" id="spVolV">${Math.round(sndCfg.vol * 100)}%</span>
+            </div>
+            <div class="sp-hint">全部由设备现场合成，不占体积、无版权问题。报告放映时也能随时关。</div>
+            <div class="sp-colors"><button class="sp-reset" id="spBgmTry">试听 8 秒</button></div>
+          </div>
           <div class="sp-actions"><button class="sp-save" id="spSave">保存</button></div>`;
         panel.querySelector('.sp-x').addEventListener('click', () => panel.classList.remove('open'));
         panel.querySelectorAll('.sp-swatch').forEach(sw => sw.addEventListener('click', () => {
@@ -1141,6 +2284,50 @@
         if (grassEl) grassEl.addEventListener('change', e => {
           try { localStorage.setItem('ta_love_grass', e.target.checked ? '1' : '0'); } catch (err) {}
           buildGrass();
+        });
+        const sfxEl = panel.querySelector('#spSfx');
+        if (sfxEl) sfxEl.addEventListener('change', e => {
+          if (window.SOUND) window.SOUND.setOn(e.target.checked);
+          const bgm = panel.querySelector('#spBgm');
+          if (bgm) { bgm.disabled = !e.target.checked; if (!e.target.checked) bgm.checked = false; }
+          const vol = panel.querySelector('#spVol');
+          if (vol) vol.disabled = !e.target.checked;
+          if (e.target.checked) sfx('ok');   // 打开时给一声确认，顺便让人听到音量
+        });
+        // 响度滑杆：拖动实时生效，松手时补一声 tap，等于"这就是调整后的音量"
+        const volEl = panel.querySelector('#spVol');
+        if (volEl) {
+          const lbl = panel.querySelector('#spVolV');
+          const put = (v) => { if (lbl) lbl.textContent = Math.round(v * 100) + '%'; };
+          put(Number(volEl.value));
+          volEl.addEventListener('input', e => {
+            const v = Number(e.target.value);
+            if (window.SOUND) window.SOUND.setVol(v);
+            put(v);
+          });
+          volEl.addEventListener('change', e => {
+            const v = Number(e.target.value);
+            if (window.SOUND) window.SOUND.setVol(v);
+            put(v);
+            sfx('tap');
+          });
+        }
+        const bgmEl = panel.querySelector('#spBgm');
+        if (bgmEl) bgmEl.addEventListener('change', e => {
+          if (window.SOUND) window.SOUND.setMusic(e.target.checked);
+          if (e.target.checked) sfx('ok');
+        });
+        const tryEl = panel.querySelector('#spBgmTry');
+        if (tryEl) tryEl.addEventListener('click', () => {
+          if (!window.SOUND) { toast('这台设备的音频不可用', 'warn', 2200); return; }
+          if (!sndCfg.on) { toast('先把「界面音效」总开关打开', 'warn', 2200); return; }
+          window.SOUND.unlock();
+          startMusic();
+          toast('试听中 · 8 秒后自动停', 'info', 2400);
+          clearTimeout(window.__bgmTry);
+          window.__bgmTry = setTimeout(() => {
+            if (!document.getElementById('reportStage')) stopMusic();   // 这期间进了报告就别停
+          }, 8000);
         });
         panel.querySelector('#spSave').addEventListener('click', () => {
           const myNick = panel.querySelector('#spMyNick').value.trim();
@@ -1173,9 +2360,13 @@
   // ================= 左侧 To-Do =================
   const TODO_KEY = 'ta_love_todos';
   const TODO_KEEP_KEY = 'ta_love_todo_keep';   // '1' = 永久保留已完成，不自动清理
+  const TODO_FOLD_KEY = 'ta_love_todo_folded'; // '1' = 折叠；没存过按折叠算
   const TODO_KEEP_DAYS = 15;                   // 已完成项默认保留天数
   const DAY_MS = 86400000;
   let todoKeepForever = false;
+  // AI 锐评的缓存：{ sig, body, advice, model }。null = 还没让模型写过，界面上显示模板版。
+  // 缓存是必须的 —— renderTodos() 每次勾选/新增都会跑，没有缓存就等于每勾一下烧一次算力。
+  let todoAi = null;
   let todoPrunedOnBoot = 0;                    // 本次启动自动清理了几条（用于提示）
 
   function loadTodoKeep() {
@@ -1277,10 +2468,50 @@
       });
     }
     if (roastEl) {
-      const r = todoRoast();
-      roastEl.innerHTML = `<span class="tr-tt">${esc(r.title)}</span>${esc(r.body)}<span class="tr-advice">狗头军师：${esc(r.advice)}</span>`;
+      const sig = todoSig();
+      // 清单变了就把旧的 AI 锐评作废 —— 拿旧清单的评价糊在新清单上是最刺眼的一种错
+      if (todoAi && todoAi.sig !== sig) todoAi = null;
+      const tpl = todoRoast();
+      const useAi = !!todoAi;
+      const body = useAi ? todoAi.body : tpl.body;
+      const tip = useAi ? todoAi.advice : tpl.advice;
+      roastEl.innerHTML =
+        `<div class="tr-head"><span class="tr-tt">${esc(useAi ? 'AI 锐评 · ' + (todoAi.model || '本地模型') : tpl.title)}</span>
+           <button class="roast-ai-btn tr-ai" id="todoAiBtn"${todos.length ? '' : ' disabled'}>${useAi ? '✦ 换一版' : '✦ AI 锐评'}</button></div>
+         <div class="tr-body">${esc(body)}</div>
+         ${tip ? `<span class="tr-advice">狗头军师：${esc(tip)}</span>` : ''}`;
+      const aiBtn = roastEl.querySelector('#todoAiBtn');
+      // 只有点了才跑模型。renderTodos 被勾选/新增频繁触发，绝不能在这里自动调 AI。
+      if (aiBtn && todos.length) aiBtn.addEventListener('click', () => runTodoAi(aiBtn));
     }
     renderTodoArchive();
+  }
+
+  // 清单签名：只跟「内容 + 完成状态」有关，用来判断缓存的锐评还作不作数
+  function todoSig() {
+    return todos.map(t => (t.done ? '1' : '0') + t.text).join('|');
+  }
+
+  // To Do 的 AI 锐评（真 AI）。清单是用户自己写的，本地模型跑，不外传。
+  async function runTodoAi(btn) {
+    if (!aiState.ready) { toast('先选一个本地 AI 模型，再让它评', 'info', 3200); openAiPanel(); return; }
+    const old = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = '生成中…';
+    try {
+      const resp = await fetch('/api/ai/todo', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ todos: todos.map(t => ({ text: t.text, done: !!t.done })) }),
+      });
+      const j = await resp.json().catch(() => ({}));
+      if (!resp.ok || !j || !j.ok) throw new Error((j && j.error) || ('HTTP ' + resp.status));
+      todoAi = { sig: todoSig(), body: j.body, advice: j.advice || '', model: j.model || '' };
+      renderTodos();
+    } catch (e) {
+      btn.disabled = false;
+      btn.textContent = old;
+      toast('生成失败：' + (e && e.message ? e.message : '未知错误'), 'error', 4200);
+    }
   }
   // ---------- 已完成归档条：只在有已完成项时出现 ----------
   function renderTodoArchive() {
@@ -1325,7 +2556,16 @@
     const panel = $('#todoPanel');
     if (addBtn) addBtn.addEventListener('click', () => { const v = input.value; if (v.trim()) { addTodo(v); input.value = ''; } });
     if (input) input.addEventListener('keydown', e => { if (e.key === 'Enter') { const v = input.value; if (v.trim()) { addTodo(v); input.value = ''; } } });
-    if (collapse && panel) collapse.addEventListener('click', () => panel.classList.toggle('collapsed'));
+    if (collapse && panel) collapse.addEventListener('click', () => {
+      const folded = panel.classList.toggle('collapsed');
+      try { localStorage.setItem(TODO_FOLD_KEY, folded ? '1' : '0'); } catch (e) {}
+    });
+    // 默认折叠：把左边让给内容。只有用户明确展开过（存了 '0'）才默认摊开。
+    if (panel) {
+      let folded = true;
+      try { const v = localStorage.getItem(TODO_FOLD_KEY); if (v !== null) folded = v === '1'; } catch (e) {}
+      panel.classList.toggle('collapsed', folded);
+    }
   }
 
   // ---------- 剪贴板抓取导入 ----------
@@ -1379,8 +2619,11 @@
       }).catch(() => toast('导入请求失败', 'err'));
     };
     const stop = () => {
+      // 先停轮询、再发请求。原来这两句在 .then() 里，而下面的 .catch 是空的 ——
+      // 只要停止请求失败一次，轮询就再也清不掉，变成每 800ms 一次的僵尸请求，
+      // 直到窗口关闭。清定时器这种事不该依赖网络成功。
+      clearInterval(timer); timer = null;
       fetch('/api/grab/stop', { method: 'POST' }).then(r => r.json()).then(d => {
-        clearInterval(timer); timer = null;
         btn.classList.remove('running');
         btn.textContent = '📋 导入聊天记录';
         status.classList.remove('running');
@@ -1451,7 +2694,10 @@
   bindGrab();
   bindAi();
   pollAiStatus();
-  setInterval(pollAiStatus, 3000); // 轮询模型下载进度/就绪态
+  // 轮询模型下载进度/就绪态。窗口不可见时跳过 —— 最小化挂着时没人看，白问一遍。
+  // 切回窗口立刻补一次，所以隐藏期间的状态变化不会被漏掉。
+  setInterval(() => { if (!document.hidden) pollAiStatus(); }, 3000);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) pollAiStatus(); });
   loadPersons();
   bindImportOne();
 })();

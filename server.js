@@ -5,19 +5,25 @@ const os = require('os');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
 const ai = require('./ai');
+const score = require('./score');   // 关系评分引擎（三指数 · 多信号合成，见 score.js 顶部注释）
 
 const ROOT = __dirname;
 const PUBLIC = path.join(ROOT, 'public');
 // 数据目录：抓取版独立目录（环境变量 TA_LOVE_DATA 优先，否则用应用目录下 data/）
 const DATA = (process.env.TA_LOVE_DATA && process.env.TA_LOVE_DATA.trim()) || path.join(ROOT, 'data');
 const MSG_DIR = path.join(DATA, 'messages');
+const AVATAR_DIR = path.join(DATA, 'avatars');
 ai.init(DATA);
 // 确保数据目录存在（首次运行自动创建）
 for (const d of [DATA, MSG_DIR]) { try { fs.mkdirSync(d, { recursive: true }); } catch (e) {} }
 // 聊天数据根目录：环境变量 TA_LOVE_WX > 当前用户 Documents\xwechat_files（仅用于读聊天软件自己生成的明文图片缩略图缓存）
 const XWECHAT_ROOT = (process.env.TA_LOVE_WX && process.env.TA_LOVE_WX.trim())
   || path.join(os.homedir(), 'Documents', 'xwechat_files');
-const PORT = 4322;
+const PORT = Number(process.env.TA_LOVE_PORT) || 4322;   // 可用环境变量换端口，方便开一个隔离实例做测试
+
+// 1×1 全透明 GIF（43 字节）。用于「图片缩略图没缓存到」的场景占位，
+// 比返回 404 干净：浏览器不会在控制台报 resource 加载失败。
+const BLANK_GIF = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -81,21 +87,19 @@ const COLORS = {
   loved: '#e0bc72',
   cold: '#c26a5a'
 };
-const SHORT_WORDS = /^(嗯|哦|好|哈|行|是|对|啊|噢|诶|哦哦|嗯嗯|好的|好哒|可以|知道|没事|嗯嗯嗯|好吧|哈哈|呵呵|ok|OK|好的呀|嗯呢|嗯那|好滴|晓得|收到|知道啦|行吧)$/;
+// 短回复/晚安/关心这类词典已收进 score.js（评分引擎自带口径，避免两处各写一份）
 
 // ---------- 情绪词典（轻量启发式） ----------
 const POS_WORDS = ['开心','高兴','哈哈','嘻嘻','嘿嘿','可爱','喜欢','爱你','想你','宝贝','亲爱的','棒','赞','漂亮','帅','甜','幸福','快乐','期待','加油','抱抱','么么','晚安','早安','耶','哇','心动','温柔','靠谱','给力','真好','太好','不错','惊喜','感动','浪漫','舒服','幸运','珍惜','暖心','贴心','hhh','lol','嘻嘻嘻','哈哈哈哈','超爱','好喜欢','真棒','好棒','美滋滋','甜甜的','爱死','么么哒'];
 const NEG_WORDS = ['烦','生气','难过','伤心','哭','讨厌','郁闷','崩溃','气死','烦死','无语','失望','焦虑','委屈','吵架','冷战','分手','滚','恨','害怕','担心','压力','疲惫','累死','饿死','困死','烦躁','心累','难受','糟糕','垃圾','恶心','嫌弃','冷漠','敷衍','无聊','烦人','上火','头疼','生病','疼','痛','唉','算了','随便','尴尬','丢人','完蛋','糟了','糟糕透','气人','讨厌死'];
 
 // ---------- 热词统计（话题词模式：2/3/4-gram + 短语加权，过滤拆词噪音） ----------
-const STOP_WORDS = new Set(['我们','你们','他们','自己','今天','明天','昨天','现在','时候','觉得','真的','还是','但是','因为','所以','如果','就是','这样','那样','这个','那个','之后','之前','一下','一点','一些','什么','为什么','可以','知道','没有','一个','怎么','怎么样','不是','不会','不要','已经','还有','然后','可是','只是','不过','虽然','可能','应该','其实','一直','一样','每次','最近','晚上','早上','中午','下午','说话','消息','聊天','感觉','有点','哈哈哈','哈哈','嘿嘿','嘻嘻','宝贝','亲爱的','晚安','早安','开心','喜欢','想你','爱你','在吗','在干嘛','吃饭','睡觉','上班','下班','工作','学校','老师','同学','朋友','家里','妈妈','爸爸','憨笑','捂脸','发呆','流泪','大哭','微笑','呲牙','撇嘴','色','酷','闭嘴','惊恐','发怒','疑问','嘘','晕','衰','骷髅','敲打','再见','擦汗','抠鼻','鼓掌','糗大了','坏笑','左哼哼','右哼哼','哈欠','鄙视','委屈','快哭了','阴险','亲亲','吓','可怜','菜刀','西瓜','啤酒','篮球','乒乓','咖啡','饭','猪头','玫瑰','凋谢','嘴唇','爱心','心碎','蛋糕','闪电','炸弹','刀','足球','钞票','便便','月亮','太阳','礼物','拥抱','强','弱','握手','胜利','抱拳','勾引','拳头','差劲','爱你','NO','OK','我去','我靠','我觉','我不','是你','是我','你的','我的','跟他','跟她','跟你','跟我','给他','给她','给你','给我','他觉','你觉','她了','他了','那些','这些','没事','问题','一起','而且','人家','个人','东西','行了','对啊','意思','死了','事情','呜呜','哎呀','反正','总之','以及','或者','接着','后来','以前','以后','同时','另外','除了','包括','比如','例如','好了','算了','明白','懂了','好吧','行吧','嗯嗯','啊啊','哦哦','么样','么办','一条','撤回','条消','记录','链接','聊天','天记','抹煋','消息','revokemsg','xml','sysmsg','对方','电话','视频','语音','图片','表情','文件','收到','看到','知道','回复','回你','回我','哈哈哈哈','哈哈哈','哈哈','哈哈哈','haha','hhh','hh']);
-// 2-gram 首字为常见单字代词/助词时视为拆词噪音
-const BAD_START = new Set('我你他她它们在的是了不有这那就也都还要会去着过跟给把被吧呢啊哦嗯呀啦嘛哈嘿和或与及又再才只已正很太最更别先刚曾好想能该可以样得为对觉己什让');
-const BAD_END = new Set('的了呢啊吧嘛呀哈');
-// 话题动词：短语中含"吃/去/玩/买"等动作核心，更像一个话题（而非语言碎片）
-const TOPIC_VERBS = new Set('吃吃喝去来在看玩买打想说聊听学写做逛睡洗唱跳跑走坐开约爱煮烤炒拍抽送修洗理剪画读背记考选找拿放带陪约见追更刷存转付退');
-// 弱话题 3-gram 开头：以"今天/我们/这个"等开头时多为口水短语，直接剔除
-const DROP_TRIPLE_START = new Set(['今天','明天','昨天','现在','这个','那个','我们','你们','他们','自己','真的','还是','但是','因为','所以','如果','就是','怎么','什么','可以','知道','没有','已经','还有','然后','只是','不过','虽然','可能','应该','其实','一直','一样','每次','晚上','早上','中午','下午','最近','感觉','原来','反正','总之','或者','以及','而且','再说']);
+const STOP_WORDS = new Set(['我们','你们','他们','自己','今天','明天','昨天','现在','时候','觉得','真的','还是','但是','因为','所以','如果','就是','这样','那样','这个','那个','之后','之前','一下','一点','一些','什么','为什么','可以','知道','没有','一个','怎么','怎么样','不是','不会','不要','已经','还有','然后','可是','只是','不过','虽然','可能','应该','其实','一直','一样','每次','最近','晚上','早上','中午','下午','说话','消息','聊天','感觉','有点','哈哈哈','哈哈','嘿嘿','嘻嘻','宝贝','亲爱的','晚安','早安','开心','喜欢','想你','爱你','在吗','在干嘛','吃饭','睡觉','上班','下班','工作','学校','老师','同学','朋友','家里','妈妈','爸爸','憨笑','捂脸','发呆','流泪','大哭','微笑','呲牙','撇嘴','色','酷','闭嘴','惊恐','发怒','疑问','嘘','晕','衰','骷髅','敲打','再见','擦汗','抠鼻','鼓掌','糗大了','坏笑','左哼哼','右哼哼','哈欠','鄙视','委屈','快哭了','阴险','亲亲','吓','可怜','菜刀','西瓜','啤酒','篮球','乒乓','咖啡','饭','猪头','玫瑰','凋谢','嘴唇','爱心','心碎','蛋糕','闪电','炸弹','刀','足球','钞票','便便','月亮','太阳','礼物','拥抱','强','弱','握手','胜利','抱拳','勾引','拳头','差劲','爱你','NO','OK','我去','我靠','我觉','我不','是你','是我','你的','我的','跟他','跟她','跟你','跟我','给他','给她','给你','给我','他觉','你觉','她了','他了','那些','这些','没事','问题','一起','而且','人家','个人','东西','行了','对啊','意思','死了','事情','呜呜','哎呀','反正','总之','以及','或者','接着','后来','以前','以后','同时','另外','除了','包括','比如','例如','好了','算了','明白','懂了','好吧','行吧','嗯嗯','啊啊','哦哦','么样','么办','一条','撤回','条消','记录','链接','聊天','天记','抹煋','消息','revokemsg','xml','sysmsg','对方','电话','视频','语音','图片','表情','文件','收到','看到','知道','回复','回你','回我','哈哈哈哈','哈哈哈','哈哈','哈哈哈','haha','hhh','hh','那么','起来','还要','想要','一般','千万','怎么着','去过']);
+// 说明：原来还有 BAD_START / BAD_END / DROP_TRIPLE_START / TOPIC_VERBS 四张表，
+// 都是给 n-gram 滑窗擦屁股用的（把「我的XX」「今天XX」这类跨词碎片挡掉）。
+// 换成词典分词后碎片根本不会产生，留着反而误伤真词（「对不起」「了不起」都是好词），已删。
+// STOP_WORDS 里补了几个分词后才冒出来的高频虚词（那么/起来/还要/想要/一般）——
+// 它们是真词但没内容，靠词频也分不出来（实测 idf 和好词完全重叠），只能点名列黑。
 // 口水整词：即使出现多次也不作为话题上榜
 const CHATTER_WORDS = new Set(['但是我','所以我','因为你','然后我','然后你','呜呜呜','呜呜呜呜','哈哈哈哈哈哈','哈哈哈','嘿嘿嘿','嘻嘻嘻','怎么说','一个人','原来如此','原来如','来如此','感觉你','没有什么','没事没事','没事没','事没事','怎么办','好不好','行不行','在不在','对不对','是不是','有没有','喜不喜欢','哈哈哈','好叭','好吧','行吧','哦哦','嗯嗯','啊啊啊','啊哈哈','我我我','你你你','真的吗','真的呀','好吧那','算了算了','就这样','这个样子','什么鬼','为什么呀','天哪','天呐','我的天','救命','无语了','醉了','绝了','笑死','笑死我','哈哈笑死','哎呦','哎哟','哈哈哈啊','笑死我了','哈哈哈','笑哭','笑不活','蚌埠住','yyds','哈哈哈','嘻嘻哈哈','但是我觉']);
 // 英文/拼音碎片黑名单（extractWords 已对小写英文，故 STOP/CHATTER 需同时按小写匹配；并补常见聊天语气词）
@@ -103,57 +107,125 @@ const STOP_WORDS_LC = new Set([...STOP_WORDS].map(s => s.toLowerCase()));
 const CHATTER_LC = new Set([...CHATTER_WORDS].map(s => s.toLowerCase()));
 const CHATTER_EXTRA = new Set(['ok','okok','wc','emmm','emm','woc','oi','lol','lmao','omg','u1s1','awsl','emo','mm','xjj','gg','xd','dbq','bhys','nsdd','yysy','yyds','bs','srds','pljj','xm','xdm']);
 
+// ---------- 词表 + 最大概率分词 ----------
+// 热词的候选必须先是一个「词」。原先用 2/3/4-gram 滑窗挖，「我今天早起跑了三公里」会挖出
+// 「天早起跑」「跑了三公」「起跑了三」这种跨词碎片——纯统计筛不掉，只有词典能判词边界。
+// 所以随包带一份词表（工具/生成词表.js 从结巴词典裁出来的 4 万高频词，MIT，452KB），
+// 分词后再挑词，口径才对得上「说得最多的词」这句话。
+const WORD_FREQ = new Map();
+let WORD_TOTAL = 1;
+try {
+  for (const line of fs.readFileSync(path.join(ROOT, 'wordlist.txt'), 'utf8').split('\n')) {
+    if (line[0] === '#') { WORD_TOTAL = Number(line.slice(1)) || 1; continue; }
+    const sp = line.lastIndexOf(' ');
+    if (sp > 0) WORD_FREQ.set(line.slice(0, sp), Number(line.slice(sp + 1)) || 0);
+  }
+} catch (e) {
+  console.error('读不到 wordlist.txt，热词会退化成单字：' + e.message);
+}
+const LOG_TOTAL = Math.log(WORD_TOTAL);
+const WORD_MAX = 6;                       // 词表最长 6 字，超过的不可能是词
+const UNK_LOG = Math.log(0.5) - LOG_TOTAL; // 表外单字的兜底分：很小但大于 0，保证句子切得开
+
+// 最大概率路径分词（结巴的核心）。从右往左算「从这里到句尾」的最优得分，
+// 每步只试 6 种切法，最后顺着 step 走一遍就切好了。
+function cutWord(s) {
+  const n = s.length;
+  const best = new Array(n + 1).fill(-Infinity);
+  const step = new Array(n + 1).fill(1);
+  best[n] = 0;
+  for (let i = n - 1; i >= 0; i--) {
+    const end = Math.min(n, i + WORD_MAX);
+    for (let j = i + 1; j <= end; j++) {
+      const f = WORD_FREQ.get(s.slice(i, j));
+      if (!f && j - i > 1) continue;                 // 表外多字组合不成词
+      const sc = (f ? Math.log(f) - LOG_TOTAL : UNK_LOG) + best[j];
+      if (sc > best[i]) { best[i] = sc; step[i] = j; }
+    }
+  }
+  const out = [];
+  for (let i = 0; i < n;) { const j = step[i]; out.push(s.slice(i, j)); i = j; }
+  return out;
+}
+
+// 分词 → 候选词。只留 2 字以上：单字基本都是虚词，进榜只会是噪音。
 function extractWords(text) {
   const out = [];
   const clean = String(text || '').replace(/\[[^\]]+\]/g, ' ');
-  const cn = clean.match(/[\u4e00-\u9fa5]{2,}/g) || [];
-  for (const s of cn) {
-    const L = s.length;
-    if (L >= 4) for (let i = 0; i <= L - 4; i++) out.push({ w: s.slice(i, i + 4), n: 3 });
-    if (L >= 3) for (let i = 0; i <= L - 3; i++) out.push({ w: s.slice(i, i + 3), n: 2 });
-    if (L === 2) out.push({ w: s, n: 1 });
-    else for (let i = 0; i <= L - 2; i++) out.push({ w: s.slice(i, i + 2), n: 1 });
+  // 标点处断开：跨标点拼出来的词一定是假的
+  for (const run of clean.match(/[\u4e00-\u9fa5]{2,}/g) || []) {
+    for (const w of cutWord(run)) if (w.length >= 2) out.push(w);
   }
-  const en = clean.match(/[a-zA-Z]{2,}/g) || [];
-  for (const w of en) out.push({ w: w.toLowerCase(), n: 2 });
+  for (const w of clean.match(/[a-zA-Z]{2,}/g) || []) out.push(w.toLowerCase());
   return out;
 }
-function topWords(msgs, me, limit) {
-  const cnt = new Map();
-  const wmap = new Map();
+
+// 人名/昵称污染：把名字的 2 字以上片段收起来，含这些片段的候选词直接扔掉。
+// 只收 2 字以上，「小雨」不会误伤「下雨天」（「下雨」不是「小雨」的子串）。
+function nameStems(names) {
+  const out = new Set();
+  for (const n of names) {
+    const s = String(n || '').replace(/[\s·・\-_]/g, '');
+    if (s.length < 2) continue;
+    for (let i = 0; i < s.length; i++) for (let j = i + 2; j <= s.length; j++) out.add(s.slice(i, j));
+  }
+  return out;
+}
+// 这个候选词该不该扔
+function badWord(w, drop) {
+  if (STOP_WORDS.has(w) || CHATTER_WORDS.has(w) || STOP_WORDS_LC.has(w) || CHATTER_LC.has(w) || CHATTER_EXTRA.has(w)) return true;
+  if (drop && drop.size) for (const s of drop) if (w.includes(s)) return true;
+  return false;
+}
+
+// 热词统计（话题词模式：2/3/4-gram + 短语加权，过滤拆词噪音）
+//
+// 打分主轴是 df（出现在多少条消息里），不是出现总次数。
+// 原来用总次数，一个人连刷 20 遍同一个词就能把它顶到榜首，可那个词往往只是口头禅；
+// 换成 df 之后，跨很多条消息反复出现的词才算「热」，刷屏刷不出来。
+// taken 是「已经被挑走的词」，跨两次调用共享（我先、TA 后）。
+// 不共享的话两边会各自独立挑一遍，「开会」和「天开会开」就同时出现在两个人的榜上。
+function topWords(msgs, me, limit, drop, taken) {
+  const df = new Map();    // 出现在多少条消息里
+  const tf = new Map();    // 一共出现多少次
   for (const m of msgs) {
     if ((m.me === 1) !== me) continue;
-    const text = String(m.c || '').replace(/[，。！？!?,.~～\s]/g, '');
-    if (text.length < 2) continue;
-    for (const { w, n } of extractWords(m.c)) {
-      if (STOP_WORDS.has(w) || CHATTER_WORDS.has(w) || STOP_WORDS_LC.has(w) || CHATTER_LC.has(w) || CHATTER_EXTRA.has(w)) continue;
-      if (w.length === 2 && (BAD_START.has(w[0]) || BAD_END.has(w[1]))) continue;
-      if (w.length >= 3 && (BAD_START.has(w[0]) || BAD_END.has(w[w.length - 1]))) continue;
-      if (w.length >= 3 && DROP_TRIPLE_START.has(w.slice(0, 2))) continue;
-      cnt.set(w, (cnt.get(w) || 0) + 1);
-      wmap.set(w, Math.max(wmap.get(w) || 0, n));
+    if (String(m.c || '').replace(/\[[^\]]+\]/g, ' ').replace(/[，。！？!?,.~～、；;：:\s]/g, '').length < 2) continue;
+    const seen = new Set();
+    for (const w of extractWords(m.c)) {
+      tf.set(w, (tf.get(w) || 0) + 1);
+      if (!seen.has(w)) { seen.add(w); df.set(w, (df.get(w) || 0) + 1); }
     }
   }
-  const scored = [...cnt.entries()]
-    .filter(([w, c]) => !(w.length >= 4 && c < 3) && !(w.length === 3 && c < 2))   // 4-gram 至少 3 次、3-gram 至少 2 次，压低一次性长碎片噪声
-    .map(([w, c]) => {
-      let score = c * (wmap.get(w) || 1);
-      if (w.length === 3) score *= 1.15;
-      else if (w.length === 4) score *= 1.3;
-      if (TOPIC_VERBS.has(w[0]) || TOPIC_VERBS.has(w[w.length - 1])) score *= 1.2;
-      return { w, n: c, score };
-    }).sort((a, b) => b.score - a.score || b.n - a.n);
+  const scored = [];
+  for (const [w, d] of df) {
+    if (badWord(w, drop)) continue;
+    if (d < (w.length >= 4 ? 2 : 3)) continue;   // 长碎片至少出现在 2 条、短词至少 3 条消息里，压低一次性噪音
+    scored.push({ w, n: tf.get(w) || d, df: d });
+  }
+  // 排序即选词策略，两条规则：
+  // 1) 先看 df。出现在越多条消息里越热，跟长度无关。
+  // 2) df 打平时**选短的**。这条是关键：中文里一个 4 字窗口十有八九是跨词切的
+  //    （「我今天早起跑了三公里」会切出「天早起跑」「跑了三公」「起跑了三」），
+  //    而它们的 2 字组成部分（早起 / 跑了）出现的次数只会**大于等于**它们。
+  //    所以长词只有在 df 严格更高时才配当「一个词」——这就是最大短语判据。
+  //    反过来（给长词加权）会把整屏切成跨词碎片，正是之前那版的问题。
+  //    df 相同再按出现次数、最后按字典序，保证结果稳定可复现。
+  scored.sort((a, b) => b.df - a.df || a.w.length - b.w.length || b.n - a.n || (a.w < b.w ? -1 : 1));
+  // 去重叠：已选的和候选的只要互相包含就跳过。短词先入选 → 跨词的长窗口自然被这条挡掉。
   const picked = [];
-  const banned = new Set();
+  const clash = (w) =>
+    picked.some(p => p.w.includes(w) || w.includes(p.w)) ||
+    (taken && [...taken].some(t => t.includes(w) || w.includes(t)));
   for (const s of scored) {
     if (picked.length >= limit) break;
-    if (banned.has(s.w)) continue;
-    picked.push({ w: s.w, n: s.n });
-    if (s.w.length >= 3) {
-      for (let i = 0; i + 2 <= s.w.length; i++) banned.add(s.w.slice(i, i + 2));
-    }
+    if (clash(s.w)) continue;
+    picked.push({ w: s.w, n: s.n, df: s.df });
+    if (taken) taken.add(s.w);
   }
-  return picked;
+  // 挑谁进来按上面的规则，但排出来的顺序按真实出现次数 ——
+  // 否则界面上会看到「179 排在 212 前面」，数字和顺序对不上，像 bug。
+  return picked.sort((a, b) => b.n - a.n || b.df - a.df);
 }
 // 情绪基调：每条消息正负词计数 → 逐段正向占比（与趋势段对齐）
 function sentimentSeries(msgs, segRanges) {
@@ -313,16 +385,122 @@ function extractAnniversaries(msgs) {
   return out.slice(0, 8);
 }
 
-// 热情值（被爱指数）校准：去掉"均衡即 50 分"的虚高锚点，需多重强信号才上扬；
-// 单方面狂发（startRatio 偏离 0.5）会打折——热情是你撑的还是 TA 给的，得分要分开算
-function calcLoved(taRatio, replyGrade, startRatio) {
-  let s = 40;                                   // 底分 40，告别"聊两句就 50 分"
-  s += (taRatio - 0.5) * 55;                    // TA 说得越多越热情（±27.5）
-  s += (replyGrade - 50) * 0.5;                 // 秒回最多 +25，慢回则扣分
-  const imbal = Math.abs((startRatio == null ? 0.5 : startRatio) - 0.5);
-  s -= imbal * 45;                              // 你单方面撑起对话，TA 热情要打折
-  return Math.max(0, Math.min(100, Math.round(s)));
+// ---------- 承诺识别：从聊天里挑出「答应过的事」 ----------
+// 原则是「宁缺毋滥」：漏掉几条无所谓，但把「明天有空吗」认成承诺会很扫兴。
+// 计分制：命中条目权重累加，够阈值才收；疑问句/玩笑/转述直接排除。
+// 承诺的典型结构是「未来时间词 + 给对方好处」，所以时间词那两条权重最高。
+const PROMISE_RULES = [
+  // —— 明确表态 ——
+  { re: /我(?:保证|发誓|承诺|答应你|肯定会|一定会)/, w: 3 },
+  { re: /说好(?:了|的)|一言为定|拉钩|说话算话|绝不食言|说到做到/, w: 3 },
+  { re: /(?:下次|改天|回头)(?:一定|肯定|必须)/, w: 2 },
+  // —— 未来时间 + 给予动作（最典型的承诺句式）——
+  { re: /(?:明天|后天|下周|下星期|下个月|(?:这|本|下)?(?:个)?周末|下次|改天|过几天)[^。！？\n]{0,14}(?:带你|陪你|请你|帮你|给你|买给|送给)/, w: 3 },
+  { re: /(?:带你|陪你|请你|帮你|给你|送你)[^。！？\n]{0,10}(?:去|吃|玩|看|喝|买|走|打|搬|修|弄|办|寄|带)/, w: 2 },
+  // —— 未来时间 + 上门动作（"我明天过去找你" 这类，不带"带你"也是承诺）——
+  { re: /(?:明天|后天|今晚|待会|等会|晚点|下班|周末)(?:我)?(?:过来|过去|来|去)[^。！？\n]{0,6}(?:找你|看你|接你|陪你)/, w: 2 },
+  // —— 弱信号：一起做某事 / 约定 ——
+  { re: /(?:我|咱)(?:们)?(?:一起|一块)(?:去|吃|玩|看|走|做)/, w: 1.2 },
+  { re: /(?:约|定)(?:好|个)(?:时间|地方|日子)/, w: 1.5 },
+  { re: /(?:改天|下次|回头)(?:约|见|一起|带你|陪你)/, w: 1 },   // 单说"改天约"也算——它至少是句口头约定
+  { re: /我会(?:好好|认真|努力|改|注意)/, w: 2 },
+];
+// 明显不是承诺的：疑问、反问、玩笑、推托、转述
+const PROMISE_NO = /[吗麼么?？]\s*$|算了|开玩笑|逗你|骗你的|别当真|你自己|问你呢|有空吗|在吗|干嘛呢|好不好$/;
+// 条件句常是谈判不是承诺（"你要是来我就请你吃饭"），降权但不当成噪声
+const PROMISE_COND = /(?:如果|要是|假如|除非)[^。！？\n]{0,20}(?:就|才)/;
+
+function detectPromises(msgs) {
+  const out = [];
+  const seen = new Set();
+  for (const m of msgs) {
+    const txt = String(m.c || '').trim();
+    if (!txt || txt.length < 4 || txt.length > 60) continue;   // 太短没信息量，太长多是转发段子
+    if (m.sys) continue;
+    if (/^\[|^<\?xml/.test(txt)) continue;                     // 图片/表情/系统卡片
+    if (PROMISE_NO.test(txt)) continue;
+    let score = 0;
+    for (const r of PROMISE_RULES) if (r.re.test(txt)) score += r.w;
+    if (PROMISE_COND.test(txt)) score -= 1;
+    if (score < 2) continue;
+    const key = txt.toLowerCase();
+    if (seen.has(key)) continue;                               // 同一句话刷多次只留一条
+    seen.add(key);
+    out.push({
+      text: txt,
+      who: m.me === 1 ? 'me' : 'ta',
+      at: m.t > 1e12 ? Math.floor(m.t / 1000) : m.t,
+      score,                                                   // 留着重算 id 用
+    });
+  }
+  // 最近的排在最前；上限 40 条，避免话痨把面板撑爆
+  return out.sort((a, b) => b.at - a.at).slice(0, 40);
 }
+
+// 稳定 id：同一条承诺每次分析都算出同一个 id，用户的「已兑现/已删除」才不会丢
+function promiseId(p) {
+  return 'pm' + md5hex((p.text || '') + '|' + (p.at || 0)).slice(0, 10);
+}
+
+// ---------- 承诺存储（data/promises.json）----------
+// 结构：{ "<personId>": { keepForever: bool, items: [...] } }
+// items 里 auto=true 是自动识别的，false 是用户自己加的；两种都能改文字 / 标兑现 / 删除。
+// 用户动过的自动项必须留痕（edited / deleted），否则下次重算分析它又原样冒出来 —— 这是最烦人的点。
+const PROMISE_PATH = path.join(DATA, 'promises.json');
+const PROMISE_KEEP_DAYS = 15;   // 已兑现默认保留天数（与 To Do 保持一致）
+
+function readPromiseStore() {
+  const j = readJson(PROMISE_PATH);
+  return (j && typeof j === 'object' && !Array.isArray(j)) ? j : {};
+}
+function writePromiseStore(store) {
+  try { fs.writeFileSync(PROMISE_PATH, JSON.stringify(store || {}, null, 1), 'utf8'); } catch (e) {}
+}
+
+// 把「这次分析识别出的」和「用户改过的」合成一份
+function mergePromises(personId, autoItems) {
+  const store = readPromiseStore();
+  const box = store[personId] || { keepForever: false, items: [] };
+  const known = new Map((box.items || []).map(it => [it.id, it]));
+  const merged = [];
+  for (const a of autoItems) {
+    const id = promiseId(a);
+    const old = known.get(id);
+    if (old) {
+      merged.push(Object.assign({}, old, {
+        text: old.edited ? old.text : a.text,   // 用户改过就别覆盖回去
+        who: old.edited && old.who ? old.who : a.who,
+        at: a.at,
+        auto: true,
+      }));
+      known.delete(id);
+    } else {
+      merged.push({ id, text: a.text, who: a.who, at: a.at, auto: true, done: false, doneAt: 0, edited: false, deleted: false });
+    }
+  }
+  for (const it of known.values()) merged.push(it);   // 手动加的 + 删除留痕的
+  merged.sort((a, b) => (b.at || 0) - (a.at || 0));
+  return { keepForever: !!box.keepForever, items: merged };
+}
+
+function savePromises(personId, box) {
+  const store = readPromiseStore();
+  // 删除留痕超 60 天的清掉，免得文件无限长大（那时对应消息也早翻不到了）
+  const items = (box.items || []).filter(it => !(it.deleted && it.auto && (Date.now() / 1000 - (it.at || 0)) > 60 * 86400));
+  store[personId] = { keepForever: !!box.keepForever, items };
+  writePromiseStore(store);
+  return store[personId];
+}
+
+// 已兑现清理：开了永久保留就一条不动
+function pruneDonePromises(box) {
+  if (box.keepForever) return 0;
+  const before = (box.items || []).length;
+  box.items = (box.items || []).filter(it => !(it.done && it.doneAt && (Date.now() - it.doneAt) > PROMISE_KEEP_DAYS * 86400000));
+  return before - box.items.length;
+}
+
+// 被爱指数的算法已移到 score.js（scoreLoved）——它现在由多路信号合成，不再是单一公式。
 
 // ---------- AI 锐评（毒舌但友好）：规则模板 + 联系人种子变体
 // 同一联系人评语稳定（种子确定）；不同联系人即使触发同一规则也拿到不同措辞，消除同质化
@@ -331,6 +509,17 @@ function buildRoast(d) {
   const g = {};
   for (const x of d.gauges) g[x.key] = x.value;
   const cold = g.cold || 0, active = g.active || 0, loved = g.loved || 0;
+  // 信号层：文案里的数字必须来自真实信号。指数分值（0-100 的合成分）和
+  // 「单字回复率 31%」这种原始比率是两码事，混着念出来的话就是假数字。
+  const sg = d.signals || {};
+  const S = (k, fb) => (typeof sg[k] === 'number' ? sg[k] : fb);
+  const startPct = Math.round(S('startRatio', 0.5) * 100);
+  const shortPct = Math.round(S('shortPct', 0));
+  const taPct = Math.round(S('taRatio', 0.5) * 100);
+  const bombN = S('bombN', 0), bombMax = S('bombMax', 0);
+  const lenRatio = S('lenRatio', 1), nightN = S('nightN', 0), careN = S('careN', 0);
+  const ignoredN = S('ignoredN', 0), replyN = S('replyN', 0), ignoredRate = S('ignoredRate', 0);
+  const taMidSec = Math.round(S('midTaReply', 7200)), meMidSec = Math.round(S('midReply', 7200));
   const daily = d.dailyMsg || 0;
   const pp = d.sentiment.positivePct;
   const is = d.imgStats || {};
@@ -348,17 +537,26 @@ function buildRoast(d) {
   let seed = 0;
   const seedStr = String(d.id || '') + ':' + String(d.name || '');
   for (let i = 0; i < seedStr.length; i++) seed = (seed * 31 + seedStr.charCodeAt(i)) >>> 0;
-  const pick = arr => (arr && arr.length ? arr[seed % arr.length] : '');
   const pick2 = (arr, salt) => (arr && arr.length ? arr[(seed + salt) % arr.length] : '');
 
   // 候选池：每条规则带权重（数值越极端权重越高），最后取最显著特征 + 该规则的种子变体
   const pool = [];
   const add = (ok, weight, templates) => { if (ok && templates && templates.length) pool.push({ w: weight, t: templates }); };
-  add(cold >= 45, 100, [`对方单字回复率 ${cold}%，这敷衍程度快赶上银行客服了。建议下次直接发选择题，别发填空题。`, `TA 的单字回复率 ${cold}%，每个"嗯"字都像在给聊天室上锁。要不咱换个会开锁的人聊？`, `${cold}% 的单字回复率，跟 TA 聊天像在跟 ATM 机对话——只有确认键和取消键。`]);
-  add(cold >= 28, 88, [`TA 的短回复占比 ${cold}%，聊天温度堪比冷库。多问两句"你觉得呢"，比发十个表情包有用。`, `短回复占了 ${cold}%，TA 的聊天风格像极了期末监考老师：惜字如金，句句致命。`, `TA 的回复短到可以当弹幕刷屏（${cold}%），建议下次发个"收到请扣1"测试一下。`]);
-  add(active >= 72 && loved < 45, 92, [`你发起对话占比 ${active}%，像个永动机；TA 回应热情 ${loved}%，像个节能灯。一个发电一个省电，这组合挺环保。`, `你主动 ${active}%、TA 回应 ${loved}%，一个在开演唱会一个在打盹。建议把话筒递给 TA 试试。`]);
-  add(loved >= 78 && active >= 60, 95, [`双向奔赴，甜度 ${Math.round((loved + active) / 2)} 分。建议保持点距离，防止血糖超标。`, `你主动 ${active}% 她回应 ${loved}%，双向奔赴实锤。聊天记录已经替你官宣了，就差你开口了。`]);
-  add(loved >= 72, 90, [`TA 的热情值 ${loved}%，回消息速度比外卖还快。这波明显是 TA 先动的心，你偷着乐吧。`, `TA 热情值 ${loved}%，回消息比抢红包还积极。这反应速度，说没好感谁信？`, `TA 的回应热度 ${loved}%，这热情指数放在股市是要被监管问询的。`, `热情值 ${loved}%，回得比你还快——请问你俩谁在追谁？这剧本拿反了都。`]);
+  add(cold >= 45, 100, [`对方单字回复率 ${shortPct}%，这敷衍程度快赶上银行客服了。建议下次直接发选择题，别发填空题。`, `TA 的单字回复率 ${shortPct}%，每个"嗯"字都像在给聊天室上锁。要不咱换个会开锁的人聊？`, `${shortPct}% 的单字回复率，跟 TA 聊天像在跟 ATM 机对话——只有确认键和取消键。`]);
+  add(cold >= 26, 88, [`TA 的短回复占比 ${shortPct}%，聊天温度堪比冷库。多问两句"你觉得呢"，比发十个表情包有用。`, `短回复占了 ${shortPct}%，TA 的聊天风格像极了期末监考老师：惜字如金，句句致命。`, `TA 的回复短到可以当弹幕刷屏（${shortPct}%），建议下次发个"收到请扣1"测试一下。`]);
+  // 被晾着：比"回复短"更硬的证据 —— TA 平均几十秒就回，却有那么几次让你等了两小时以上
+  add(ignoredN >= 8 && ignoredRate >= 0.04, 94, [`TA 平时 ${score.dur(taMidSec)} 就回你，但有 ${ignoredN} 次让你等了两个钟头以上（${replyN} 次回复里占 ${Math.round(ignoredRate * 100)}%）。偶尔一次是忙，这个比例就是态度了。`, `${ignoredN}/${replyN} 次回复，TA 拖过了两小时。按 TA 平时的速度，这已经不是"没看到"，是"看到了没急着回"。`, `你被晾了两个小时以上的次数是 ${ignoredN}（一共 ${replyN} 次回复，占 ${Math.round(ignoredRate * 100)}%）。别急着自我反思，先把这几次摆出来看看有没有规律。`]);
+  // 连续轰炸：你发的不是一条消息，是一串
+  add(bombN >= 3 && bombMax >= 6, 90, [`你有 ${bombN} 段对话在连发，最长一次连着发了 ${bombMax} 条没人接。屏幕这头是急，屏幕那头是难回。`, `连发 ${bombMax} 条的战绩出现了 ${bombN} 次。对方不是不想回，是一时不知道该先回哪条。`, `${bombN} 次连发、最长 ${bombMax} 条——你的表达欲比这条通道的带宽大得多。攒成一条说，回的概率反而高。`]);
+  // 消息长度比：谁在认真打字
+  add(lenRatio >= 1.8, 78, [`你的消息平均长度是 TA 的 ${lenRatio.toFixed(1)} 倍。你写小作文，TA 回关键词，这不对等是长期的。`, `长度比 ${lenRatio.toFixed(1)}:1，你打的字能出书，TA 打的字够发弹幕。热情没错，但值得被接住。`, `你平均每条消息是 TA 的 ${lenRatio.toFixed(1)} 倍长。不是要你也变短，是这份认真得有人接。`]);
+  // 晚安/早安：低成本高频的仪式感，比消息量更能说明关系稳不稳
+  add(nightN >= 20, 84, [`TA 对你说过 ${nightN} 次晚安/早安这类话。别小看这几个字，愿意每天花十秒惦记你的，不多。`, `累计 ${nightN} 次晚安/早安——仪式感这东西，比说一百句"喜欢你"更扛时间。`, `${nightN} 次晚安或早安。这种每天准点出现的在意，属于关系的底噪，安静但一直在。`]);
+  // 关心频率：不是聊得开心，是惦记你
+  add(careN >= 15, 82, [`TA 关心过你 ${careN} 次（吃饭没、多穿点、别熬夜这类）。话不甜，但都是实心儿的。`, `${careN} 次"吃饭了吗""早点睡"——中国式关心从来不说爱，只说别着凉。`, `TA 的关心出现 ${careN} 次。这种絮叨式的在意，比甜言蜜语值钱。`]);
+  add(active >= 72 && loved < 45, 92, [`你开的话头占 ${startPct}%，像个永动机；TA 的被爱指数只有 ${loved} 分，像个节能灯。一个发电一个省电，这组合挺环保。`, `你先开口 ${startPct}%，TA 那边被爱指数 ${loved} 分。一个在开演唱会，一个在打盹。建议把话筒递过去试试。`]);
+  add(loved >= 78 && active >= 60, 95, [`双向奔赴，甜度 ${Math.round((loved + active) / 2)} 分。建议保持点距离，防止血糖超标。`, `你主动 ${active} 分、TA 被爱 ${loved} 分，双向奔赴实锤。聊天记录已经替你官宣了，就差你开口了。`]);
+  add(loved >= 72, 90, [`TA 的热情值 ${loved} 分，回你中位数只要 ${score.dur(taMidSec)}。这波明显是 TA 先动的心，你偷着乐吧。`, `TA 被爱指数 ${loved}，回消息平均 ${score.dur(taMidSec)}，比抢红包还积极。这反应速度，说没好感谁信？`, `TA 的回应热度 ${loved} 分，这热情指数放在股市是要被监管问询的。`, `被爱指数 ${loved} 分：TA 平均 ${score.dur(taMidSec)} 就回你，你回 TA 要 ${score.dur(meMidSec)}——请问你俩谁在追谁？这剧本拿反了都。`]);
   add(d.coldDays >= 5, 96, [`你们已经 ${d.coldDays} 天没联系了，再冷下去可以申报极地科考项目了。`, `${d.coldDays} 天没动静，这段关系已经进入冬眠模式。建议下个节气前解冻，不然真要长蘑菇了。`, `${d.coldDays} 天零对话，这记录够格入选"冷战名人堂"了。`]);
   add(d.coldDays >= 3, 82, [`${d.coldDays} 天没说话了，这关系比秋天的落叶还冷。主动发个"在吗"，成本为零。`, `${d.coldDays} 天没聊了，再冷下去聊天记录都要结冰。发个表情包破冰，稳赚不赔。`]);
   add(daily >= 80, 90, [`日均 ${daily} 条消息，你们是把聊天软件当对讲机，还是怕对方一秒钟就消失？`, `日均 ${daily} 条，这聊天密度堪比连续剧更新。建议留点悬念，别一集全播完。`, `日均 ${daily} 条消息，手机电量一半都是聊 TA 聊没的。`]);
@@ -405,11 +603,32 @@ function buildRoast(d) {
   // 狗头军师 · 相处建议（战略式、反套路，依主导特征出谋）
   const advicePick = (conds) => { for (const c of conds) { if (c.ok) return pick2(c.t, c.salt || 5); } return ''; };
   const advice = advicePick([
+    // 被晾着：最硬的一条证据，优先给建议
+    // 措辞不预设关系是恋爱 —— 这个入口也会用在父母、老友身上
+    { ok: ignoredN >= 8 && ignoredRate >= 0.05, salt: 12, t: [
+      `TA 平时 ${score.dur(taMidSec)} 就回，却有 ${ignoredN} 次让你等了两小时以上。先别急着追问"在忙吗"，做个实验：连三次只发一条、不带问句、不需要回应，看 TA 会不会自己回来找你。会，说明只是忙；不会，你也拿到了答案。`,
+      `${ignoredN} 次异常长的等待（占 ${Math.round(ignoredRate * 100)}%）。追问换不来回应，把节奏慢下来反而更清楚：发完就放下手机，让沉默自己说话。`
+    ]},
+    // 连发：不是缺点，是方式不对
+    { ok: bombN >= 3 && bombMax >= 6, salt: 13, t: [
+      `试过连发 ${bombMax} 条吗？对面看着一屏消息，第一反应是"等会儿一起回"，然后就忘了。把三句话压成一句，回的概率翻倍。`,
+      `连发 ${bombN} 段的习惯改一改：发一条，等回应，再发下一条。留个气口，对话才转得起来。`
+    ]},
+    // 长度不对等：认真被辜负的方式有很多种，这是最安静的一种
+    { ok: lenRatio >= 1.8, salt: 14, t: [
+      `你的消息是 TA 的 ${lenRatio.toFixed(1)} 倍长。别把字数当诚意证明——试着用一句轻的换一句轻的，节奏对上了，人才愿意多说。`,
+      `长度比 ${lenRatio.toFixed(1)}:1 说明什么？你在交付，TA 在签收。降低单条信息量，反而更容易等到真心话。`
+    ]},
+    // TA 有仪式感 → 得接住，别当成理所当然
+    { ok: nightN >= 20 || careN >= 15, salt: 15, t: [
+      `TA 累计 ${nightN} 次晚安/早安、${careN} 次关心你。这些都不是自动回复，是有人在花心思。下次轮到你起头，把这份在意接住。`,
+      `别只收不发。TA 的 ${nightN + careN} 次问候说明在意是真的，你也固定给 TA 一条——两个人都在经营的才叫关系。`
+    ]},
     { ok: active >= 70 && loved < 50, salt: 1, t: [
       `你这发起频率像在给关系打肾上腺素。偶尔战略性沉默 48 小时，看 TA 会不会主动找你——不找，你心里就有数了。`,
       `单方面狂发等于替两个人谈恋爱。把"在干嘛"换成一件你正在经历的小事，把球踢给 TA，看接不接。`
     ]},
-    { ok: cold >= 35, salt: 2, t: [
+    { ok: cold >= 30, salt: 2, t: [
       `别再用问句轰炸了。把填空题换成分享——丢一件你正在做的事，让人接得住话，比十个"在吗"强。`,
       `TA 在惜字如金，你越追问越冷。先停三天，再用一条不带期待的分享破冰，反而勾人。`
     ]},
@@ -458,10 +677,7 @@ function analyze(id, name, msgs, isGroup) {
   // 图片/表情统计（图片类消息不参与文本特征分析）
   let meImg = 0, taImg = 0, meEmoji = 0, taEmoji = 0;
   // 系统/卡片文本（撤回提示、revokemsg XML、[链接]/[语音]/[名片] 等）不参与任何文本特征分析
-  const isSysText = m => {
-    const s = String(m.c || '');
-    return m.sys || /^\[|^<\?xml|revokemsg|撤回了一条消息|^你撤回/.test(s);
-  };
+  const isSysText = score.isSys;
   const textMsgs = [];
   for (const m of msgs) {
     if (m.img) {
@@ -513,42 +729,26 @@ function analyze(id, name, msgs, isGroup) {
   N = msgs.length;
 
   // 会话切分：5 分钟无消息视为新段
-  const SEG_GAP = 5 * 60 * 1000;
-  const segs = [];
-  let cur = [msgs[0]];
-  for (let i = 1; i < N; i++) {
-    if (ts2ms(msgs[i].t) - ts2ms(msgs[i - 1].t) > SEG_GAP) {
-      segs.push(cur); cur = [];
-    }
-    cur.push(msgs[i]);
-  }
-  segs.push(cur);
+  const segs = score.splitSegs(msgs);
 
-  let meStarts = 0, taStarts = 0;
-  let meCnt = 0, taCnt = 0, taShort = 0, meShort = 0;
+  // 信号层：发起占比、连发、回复速度差、消息长度比、晚安/早安、关心频率、被晾着的次数……
+  // 统计口径全在 score.js，这里和趋势分段共用同一份实现，避免两处各算一套、数字对不上
+  const sig = score.signalsOf(msgs, { segs });
+  const { meStarts, taStarts, meCnt, taCnt, meRatio, taRatio, startRatio } = sig;
+
   let meLate = 0, taLate = 0;        // 22:00-02:00 双方各自深夜消息
   let meLong = 0, taLong = 0;        // >20 字 双方各自长消息
-  let replies = [];                  // 我发→TA下一条 间隔
-  let taReplies = [];                // TA发→我下一条 间隔
-  let totalSpan = ts2ms(msgs[N - 1].t) - ts2ms(msgs[0].t);
-  let totalDays = Math.max(1, totalSpan / 86400000);
+  const replies = [];                // 我发→TA下一条 间隔
+  const taReplies = [];              // TA发→我下一条 间隔
+  const totalSpan = ts2ms(msgs[N - 1].t) - ts2ms(msgs[0].t);
+  const totalDays = Math.max(1, totalSpan / 86400000);
 
-  for (const s of segs) {
-    if (s[0].me === 1) meStarts++; else taStarts++;
-  }
   for (const m of msgs) {
     const c = (m.c || '').trim();
     const h = new Date(ts2ms(m.t)).getHours();
-    if (m.me === 1) {
-      meCnt++;
-      if (c.length > 20) meLong++;
-      if (h >= 22 || h < 2) meLate++;
-    } else {
-      taCnt++;
-      if (c.length <= 4 && SHORT_WORDS.test(c.replace(/[，。！？!?,.~～\s]/g, ''))) taShort++;
-      if (c.length > 20) taLong++;
-      if (h >= 22 || h < 2) taLate++;
-    }
+    const late = h >= 22 || h < 2, long = c.length > 20;
+    if (m.me === 1) { if (late) meLate++; if (long) meLong++; }
+    else { if (late) taLate++; if (long) taLong++; }
   }
   // 双向回复间隔：我发→TA下一条 / TA发→我下一条（24h 内）
   let meSlow = 0, taSlow = 0;
@@ -565,15 +765,10 @@ function analyze(id, name, msgs, isGroup) {
   const replyScore = Math.max(0, Math.min(100, 100 - (midReply / 60) * 1.2));
   const taReplyScore = Math.max(0, Math.min(100, 100 - (midTaReply / 60) * 1.2));
 
-  const meRatio = meCnt / N;
-  const taRatio = taCnt / N;
-  const startRatio = meStarts / Math.max(1, meStarts + taStarts);
-
-  // 热情分锚定：双方均衡≈50，避免全员高分；回复速度用阶梯档位，秒回才高分
-  const activeScore = Math.max(0, Math.min(100, Math.round(50 + (startRatio - 0.5) * 70 + (meRatio - 0.5) * 30)));
-  const replyGrade = midReply <= 30 ? 100 : midReply <= 120 ? 85 : midReply <= 600 ? 65 : midReply <= 1800 ? 45 : midReply <= 7200 ? 25 : 10;
-  const lovedScore = calcLoved(taRatio, replyGrade, startRatio);
-  const coldScore = Math.round((taCnt ? taShort / taCnt : 0) * 100);
+  // 关系指数：三个指数各自由多路信号合成，parts 记着每一路贡献了几分（前端可展开看）
+  const gs = score.gaugesOf(sig);
+  const activeScore = gs.active.value, lovedScore = gs.loved.value, coldScore = gs.cold.value;
+  const symScore = score.symmetry(sig);
 
   // 趋势：按消息条数均分 8 段（每段必有数据，折线保持连续）
   const BUCKET = Math.min(8, Math.max(2, msgs.length));
@@ -582,30 +777,10 @@ function analyze(id, name, msgs, isGroup) {
   for (let b = 0; b < BUCKET; b++) {
     const from = b * bucketSize, to = Math.min(msgs.length, from + bucketSize);
     const wm = msgs.slice(from, to);
-    let wMe = 0, wTa = 0, wTaShort = 0, wReplies = [];
-    for (let i = 0; i < wm.length; i++) {
-      if (wm[i].me === 1) wMe++;
-      else {
-        wTa++;
-        const c = (wm[i].c || '').trim();
-        if (c.length <= 4 && SHORT_WORDS.test(c.replace(/[，。！？!?,.~～\s]/g, ''))) wTaShort++;
-      }
-    }
-    for (let i = 0; i < wm.length - 1; i++) {
-      if (wm[i].me === 1 && wm[i + 1].me === 0) {
-        const gap = (ts2ms(wm[i + 1].t) - ts2ms(wm[i].t)) / 1000;
-        if (gap >= 0 && gap < 86400) wReplies.push(gap);
-      }
-    }
-    wReplies.sort((a, b) => a - b);
-    const wMid = wReplies.length ? wReplies[Math.floor(wReplies.length / 2)] : 7200;
-    const wGrade = wMid <= 30 ? 100 : wMid <= 120 ? 85 : wMid <= 600 ? 65 : wMid <= 1800 ? 45 : wMid <= 7200 ? 25 : 10;
-    const wTotal = Math.max(1, wMe + wTa);
-    weeks.push({
-      active: Math.round((wMe / wTotal) * 100),
-      loved: calcLoved(wTa / wTotal, wGrade, 0.5),
-      cold: Math.round((wTa ? wTaShort / wTa : 0) * 100)
-    });
+    // 分段走同一套信号与评分函数（不传 now：历史段的"段尾"不该按此刻判断有没有被晾着）。
+    // 这样折线的最后一个点 ≈ 上面仪表盘的大数字，两处不会各说各话。
+    const wg = score.gaugesOf(score.signalsOf(wm));
+    weeks.push({ active: wg.active.value, loved: wg.loved.value, cold: wg.cold.value });
     if (wm.length) segDates.push(fmtDate(ts2ms(wm[Math.floor(wm.length / 2)].t)));
     else if (segDates.length) segDates.push(segDates[segDates.length - 1]);
     else segDates.push(fmtDate(ts2ms(msgs[0].t)));
@@ -648,20 +823,45 @@ function analyze(id, name, msgs, isGroup) {
   // 结论（启发式）
   const conclusions = [];
   const lastGapDays = (now - ts2ms(msgs[N - 1].t)) / 86400000;
+  // 冷淡：不再只念一个百分比，把三个信号一起摆出来（分是怎么来的，结论里也要看得见）
   if (coldScore >= 25) {
+    const why = [`「嗯/哦/好」类短回复 ${Math.round(sig.shortPct)}%（${Math.round(sig.shortN)} 条）`];
+    if (sig.ignoredN) why.push(`${sig.ignoredN}/${sig.replyN} 次回复让你等了两小时以上`);
+    if (sig.taSlowR >= 0.2) why.push(`超过半小时才回占 ${Math.round(sig.taSlowR * 100)}%`);
     conclusions.push({
-      level: 'warn', tag: '冷淡', title: `对方单字/短回复占比 ${coldScore}%`,
+      level: 'warn', tag: '冷淡', title: `对方敷衍信号明显（冷淡指数 ${coldScore}）`,
       score: coldScore,
-      summary: `TA 的消息中有 ${Math.round(taShort)} 条属于"嗯/哦/好"类短回复，回应长度偏低，需关注对话热情。`,
+      summary: `${why.join('、')}。回应长度偏低、回得偏慢，需关注对话热情。`,
       refs: timeline.slice(-6).filter(x => x.from === 'ta').map(x => x.id).slice(0, 4)
     });
   }
   if (activeScore >= 65) {
+    const why = [`你开的话头占 ${Math.round(startRatio * 100)}%`];
+    if (sig.bombN) why.push(`有 ${sig.bombN} 段是你在连发（最长 ${sig.bombMax} 条没人接）`);
+    if (sig.lenRatio >= 1.3) why.push(`你的消息平均是 TA 的 ${sig.lenRatio.toFixed(2)} 倍长`);
     conclusions.push({
       level: 'info', tag: '主动', title: `你发起对话占 ${Math.round(startRatio * 100)}%`,
       score: activeScore,
-      summary: `会话中由你开启话题的比例偏高，存在单方面推进迹象，可适当放缓节奏观察对方主动频率。`,
+      summary: `${why.join('、')}。会话中你推进得更多，可适当放缓节奏观察对方主动频率。`,
       refs: timeline.filter(x => x.from === 'me').slice(-4).map(x => x.id)
+    });
+  }
+  // 单向投入：主动高、被爱低——她不一样 里这条是「强制高亮」，不管排第几都要说
+  if (activeScore >= 68 && lovedScore <= 45) {
+    conclusions.unshift({
+      level: 'warn', tag: '单向', title: `单向投入预警（对称性 ${symScore}）`,
+      score: 100 - symScore,
+      summary: `你的主动指数 ${activeScore}，却只换回 ${lovedScore} 的被爱指数。不是谁不够好，是这段对话目前主要由你一个人在推——先看清楚，再决定要不要继续加码。`,
+      refs: timeline.filter(x => x.from === 'me').slice(-4).map(x => x.id)
+    });
+  }
+  // 反过来：TA 一直在找你，别装看不见
+  if (lovedScore >= 68 && activeScore <= 45) {
+    conclusions.unshift({
+      level: 'good', tag: '被在意', title: `TA 在主动，而你回应得少（对称性 ${symScore}）`,
+      score: lovedScore,
+      summary: `TA 的被爱侧信号很强（${lovedScore} 分）：主动找你、回得快${sig.nightN ? '、' + sig.nightN + ' 次晚安/早安' : ''}${sig.careN ? '、' + sig.careN + ' 次关心' : ''}。这种热度会被冷落耗尽的。`,
+      refs: timeline.filter(x => x.from === 'ta').slice(-4).map(x => x.id)
     });
   }
   if (intimacy.ta >= 15) {
@@ -794,9 +994,12 @@ function analyze(id, name, msgs, isGroup) {
   const sLoved = weeks.map(v => v ? v.loved : null);
   const sCold = weeks.map(v => v ? v.cold : null);
 
-  // 热词榜：双方各自高频词
-  const topWordsMe = topWords(msgs, true, 14);
-  const topWordsTa = topWords(msgs, false, 14);
+  // 热词榜：双方各自高频词。把联系人和我的昵称当噪音源屏蔽掉，
+  // 否则「小雨」「老周」这类称呼会稳稳占着榜首，看着像词榜其实是通讯录。
+  const wordDrop = nameStems([name, readSettings().myNick]);
+  const wordTaken = new Set();
+  const topWordsMe = topWords(msgs, true, 14, wordDrop, wordTaken);
+  const topWordsTa = topWords(msgs, false, 14, wordDrop, wordTaken);
 
   // 情绪基调：逐段正向占比 + 总体正向率
   const segRanges = [];
@@ -832,6 +1035,52 @@ function analyze(id, name, msgs, isGroup) {
   }
   if (nextAnniversary) nextAnniversary = { date: nextAnniversary.date, days: nextAnniversary.days, label: nextAnniversary.label };
 
+  // ---------- 年度报告统计 ----------
+  // 用「会话段」（5 分钟断段）当一次聊天来数，比按天更贴近体感：
+  // 一天里断断续续聊三次就是三次，而不是笼统算成一天。
+  let lateSegs = 0, hotSegs = 0, maxSegN = 0, maxSegAt = 0;
+  for (const s of segs) {
+    const h0 = new Date(ts2ms(s[0].t)).getHours();
+    if (h0 >= 22 || h0 < 2) lateSegs++;            // 深夜开聊
+    if (s.length >= 20) hotSegs++;                 // 热火朝天：一口气 20 条以上
+    if (s.length > maxSegN) { maxSegN = s.length; maxSegAt = s[0].t; }
+  }
+  // 连续聊天天数：把「有消息的日期」排成序号，找最长连号；中间的断档就是最长沉默
+  const dayNums = [...new Set(msgs.map(m => Math.floor(ts2ms(m.t) / 86400000)))].sort((a, b) => a - b);
+  let streak = 1, maxStreak = 1, maxSilence = 0;
+  for (let i = 1; i < dayNums.length; i++) {
+    const gap = dayNums[i] - dayNums[i - 1];
+    if (gap === 1) { streak++; if (streak > maxStreak) maxStreak = streak; }
+    else { streak = 1; if (gap - 1 > maxSilence) maxSilence = gap - 1; }
+  }
+  // 「最快回复」要排除同秒连发：gap=0 只是语速快，不是"秒回"，写进报告很怪
+  const firstReal = (arr) => {
+    const v = (arr || []).find(x => x >= 1);
+    return v === undefined ? 0 : Math.round(v);
+  };
+  const report = {
+    spanDays: Math.round(totalDays),
+    totalMsgs: totalN,
+    textMsgs: N,
+    dailyMsg: N / totalDays,
+    chatTimes: segs.length,                        // 一共聊了多少次
+    lateSegs, hotSegs,
+    lateNightMsgs: meLate + taLate,
+    meLate, taLate,
+    maxSegN, maxSegAt,
+    meStarts, taStarts,
+    maxStreak, maxSilence,
+    taFastest: firstReal(replies),                 // TA 回得最快的一次（秒）
+    meFastest: firstReal(taReplies),               // 我回得最快的一次（秒）
+    taMidReply: Math.round(midReply),                             // TA 回我的中位数（秒）
+    meMidReply: Math.round(midTaReply),
+    meMsgs: meCnt, taMsgs: taCnt,
+    meLong, taLong,
+    firstAt: msgs[0] && msgs[0].t,
+    lastAt: msgs[N - 1] && msgs[N - 1].t,
+    imgStats
+  };
+
   return {
     person: { id, name },
     msgCount: totalN,
@@ -846,14 +1095,17 @@ function analyze(id, name, msgs, isGroup) {
       { key: 'active', label: '主动指数', value: activeScore },
       { key: 'loved', label: '被爱指数', value: lovedScore },
       { key: 'cold', label: '冷淡指数', value: coldScore }
-    ], coldDays: Math.max(0, Math.round(lastGapDays)), dailyMsg: N / totalDays, sentiment: { positivePct: senti.positivePct }, topWords: { me: topWordsMe, ta: topWordsTa }, nextAnniversary, imgStats, sternberg, reply: { meMid: midTaReply, taMid: midReply }, spans: { days: totalDays, msgN: totalN } }),
+    ], signals: sig, symmetry: symScore, coldDays: Math.max(0, Math.round(lastGapDays)), dailyMsg: N / totalDays, sentiment: { positivePct: senti.positivePct }, topWords: { me: topWordsMe, ta: topWordsTa }, nextAnniversary, imgStats, sternberg, reply: { meMid: midTaReply, taMid: midReply }, spans: { days: totalDays, msgN: totalN } }),
     topWords: { me: topWordsMe, ta: topWordsTa },
     sentiment: { positivePct: senti.positivePct, series: senti.series },
+    // 指数的颜色 + 构成（parts：每路信号实际是多少、贡献了几分）
     gauges: [
-      { key: 'active', label: '主动指数', value: activeScore, color: COLORS.active },
-      { key: 'loved', label: '被爱指数', value: lovedScore, color: COLORS.loved },
-      { key: 'cold', label: '冷淡指数', value: coldScore, color: COLORS.cold }
+      Object.assign({ key: 'active', label: '主动指数', color: COLORS.active }, gs.active),
+      Object.assign({ key: 'loved', label: '被爱指数', color: COLORS.loved }, gs.loved),
+      Object.assign({ key: 'cold', label: '冷淡指数', color: COLORS.cold }, gs.cold)
     ],
+    signals: sig,
+    symmetry: symScore,
     trend: {
       dates,
       series: [
@@ -864,7 +1116,8 @@ function analyze(id, name, msgs, isGroup) {
     },
     sternberg,
     timeline,
-    conclusions: conclusions.slice(0, 8)
+    conclusions: conclusions.slice(0, 8),
+    report
   };
 }
 
@@ -872,38 +1125,8 @@ function md5hex(s) {
   return crypto.createHash('md5').update(s, 'utf8').digest('hex');
 }
 
-// 兼容旧缓存去重（v4 起导入时已用 server_id/local_id 唯一键，不再走内容去重）
-function dedupeMsgs(msgs) {
-  if (!Array.isArray(msgs)) return msgs;
-  const seen = new Set();
-  const out = [];
-  for (const m of msgs) {
-    const k = m.t + '|' + m.me + '|' + m.c;
-    if (seen.has(k)) continue;
-    seen.add(k);
-    out.push(m);
-  }
-  return out;
-}
-
 const MSG_VERSION = 5; // v5: 系统消息（撤回/revokemsg/lt=10000）打 sys 标记，不参与文本特征分析；v4: server_id/local_id 唯一键去重
 
-// 从 packed_info_data（protobuf 序列化：二进制 blob 或逗号分隔字节串）中提取 32 位 hex 文件名
-function packedToBytes(packed) {
-  if (Buffer.isBuffer(packed)) return packed;
-  if (typeof packed === 'string') {
-    if (/^[\d,\s]+$/.test(packed.trim())) return Buffer.from(packed.split(',').map(Number).filter(n => !isNaN(n)));
-    return Buffer.from(packed, 'utf8');
-  }
-  if (packed && typeof packed.length === 'number') {
-    const arr = Array.from(packed);
-    if (arr.length && arr.every(x => typeof x === 'number')) return Buffer.from(arr);
-    const s = arr.join('');
-    if (/^[\d,\s]+$/.test(s.trim())) return Buffer.from(s.split(',').map(Number).filter(n => !isNaN(n)));
-    return Buffer.from(s, 'utf8');
-  }
-  return Buffer.from(String(packed), 'utf8');
-}
 function ensureMessages(person) {
   const dest = path.join(MSG_DIR, `${person.id}.json`);
   const cached = readJson(dest);
@@ -1127,6 +1350,71 @@ const server = http.createServer((req, res) => {
     return json(res, list);
   }
 
+  // ---------- 承诺追踪：自动识别 + 用户手动维护合成一份 ----------
+  if (p.startsWith('/api/promises/')) {
+    const pid = decodeURIComponent(p.slice('/api/promises/'.length));
+    const persons = readJson(path.join(DATA, 'persons.json')) || [];
+    const person = persons.find(x => x.id === pid);
+    if (!person) return err(res, 404, '联系人不存在');
+    const msgs = ensureMessages(person) || [];
+    const autoItems = person.group ? [] : detectPromises(msgs);
+    const box = mergePromises(pid, autoItems);
+    const out = () => json(res, {
+      ok: true,
+      keepForever: box.keepForever,
+      keepDays: PROMISE_KEEP_DAYS,
+      items: box.items.filter(it => !it.deleted),
+    });
+
+    if (req.method === 'GET') {
+      // 打开卡片时顺手把超期的已兑现项清掉（和 To Do 同一套规则）
+      if (pruneDonePromises(box)) savePromises(pid, box);
+      return out();
+    }
+
+    if (req.method === 'POST') {
+      let body = '';
+      req.on('data', c => body += c);
+      req.on('end', () => {
+        let b = {};
+        try { b = JSON.parse(body || '{}'); } catch (e) {}
+        const op = String(b.op || '');
+        if (op === 'add') {
+          const text = String(b.text || '').trim().slice(0, 120);
+          if (!text) return err(res, 400, '内容不能为空');
+          box.items.unshift({
+            id: 'pm' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5),
+            text,
+            who: b.who === 'ta' ? 'ta' : 'me',
+            at: Math.floor(Date.now() / 1000),
+            auto: false, done: false, doneAt: 0, edited: true, deleted: false,
+          });
+        } else if (op === 'update') {
+          const it = box.items.find(x => x.id === b.id);
+          if (!it) return err(res, 404, '这条承诺已经不在了');
+          if (b.text != null) {
+            const t = String(b.text).trim().slice(0, 120);
+            if (!t) return err(res, 400, '内容不能为空');
+            it.text = t; it.edited = true;   // 打了 edited 标记，之后重算分析不会被识别结果覆盖回去
+          }
+          if (b.who != null) { it.who = b.who === 'ta' ? 'ta' : 'me'; it.edited = true; }
+          if (b.done != null) { it.done = !!b.done; it.doneAt = it.done ? Date.now() : 0; }
+        } else if (op === 'delete') {
+          const it = box.items.find(x => x.id === b.id);
+          if (!it) return err(res, 404, '这条承诺已经不在了');
+          it.deleted = true;   // 留痕，否则下次重算又被识别出来
+        } else if (op === 'keep') {
+          box.keepForever = !!b.value;
+        } else if (op === 'clearDone') {
+          box.items = box.items.filter(x => !x.done);
+        }
+        savePromises(pid, box);
+        return out();
+      });
+      return;
+    }
+  }
+
   // ---------- 应用设置：读取 / 保存（自动导入模式等） ----------
   if (req.method === 'GET' && p === '/api/settings') {
     return json(res, readSettings());
@@ -1146,15 +1434,42 @@ const server = http.createServer((req, res) => {
   }
 
   // ---------- 本地小AI：状态 / 后端探测 / 准备模型 / 生成 ----------
+  // 就绪守卫：没准备好就立刻回话，绝不顺着 ensureModel() 一路走到「下载几个 GB 内置模型」
+  // ——一个 HTTP 请求就那么挂着（实测挂死过 5 分钟）。四个 AI 接口共用这一份判定。
+  const aiReadyOr503 = (res) => {
+    const st = ai.status();
+    if (st.ready) return true;
+    err(res, 503, st.downloading
+      ? ('模型正在下载（' + Math.round(st.progress || 0) + '%），下完再点')
+      : ('本地 AI 还没就绪' + (st.error ? '：' + st.error : '，先在左侧「本地小AI」里启用')));
+    return false;
+  };
+  // AI 接口统一入口：读 JSON 体 → 廉价前置校验 → 就绪守卫 → 交给 handler。
+  // 六个接口原先各自抄一遍「读 body + 守卫 + try/catch」，这里收成一处，
+  // 免得以后加接口时漏掉守卫（漏一次就是一个挂死 5 分钟的请求）。
+  // 顺序很关键：先做**不碰模型**的校验（比如「这个联系人存在吗」），再查模型就绪。
+  // 反过来的话，查一个不存在的联系人会得到 503，语义就撒谎了。
+  // 需要 4xx 而不是 500 的场合，用 bad(code, msg) 抛。
+  const bad = (code, msg) => Object.assign(new Error(msg), { code });
+  const aiRoute = (req, res, handler, validate) => {
+    readBodyJson(req, (b) => {
+      let pre;
+      if (validate) {
+        try { pre = validate(b || {}); }
+        catch (e) { return err(res, (e && e.code) || 400, (e && e.message) || '参数不对'); }
+      }
+      if (!aiReadyOr503(res)) return;
+      Promise.resolve(handler(b || {}, pre))
+        .then((out) => json(res, out))
+        .catch((e) => {
+          const code = (e && e.code >= 400 && e.code < 600) ? e.code : 500;
+          err(res, code, (e && e.message) ? e.message : 'AI 生成失败');
+        });
+    });
+  };
+
   if (req.method === 'GET' && p === '/api/ai/status') {
     return json(res, ai.status());
-  }
-  // 重新探测本机 Ollama（用户可能刚启动服务），结果写回 status
-  if (req.method === 'POST' && p === '/api/ai/probe') {
-    ai.detectOllama()
-      .then(() => json(res, ai.status()))
-      .catch(() => json(res, ai.status()));
-    return;
   }
   if (req.method === 'POST' && p === '/api/ai/setup') {
     let body = '';
@@ -1162,7 +1477,7 @@ const server = http.createServer((req, res) => {
     req.on('end', () => {
       let b = {};
       try { b = JSON.parse(body || '{}'); } catch (e) {}
-      // 传了 backend/tier/model 就按指定的来；什么都没传则自动挑（Ollama 优先，零下载）
+      // b.tier 指定档位，不传就用上次的
       // 注意：内置档位首次要下几个 GB，不能让 HTTP 请求一直挂着等——1.2 秒没完成就先回
       // 当前状态（含 downloading/progress），前端继续轮询 /api/ai/status 看进度。
       let done = false;
@@ -1178,37 +1493,78 @@ const server = http.createServer((req, res) => {
   }
   // 真·AI 锐评
   if (req.method === 'POST' && p === '/api/ai/roast') {
-    let body = '';
-    req.on('data', c => body += c);
-    req.on('end', async () => {
-      let b = {};
-      try { b = JSON.parse(body || '{}'); } catch (e) {}
-      const d = b.d;
-      if (!d || typeof d !== 'object') return err(res, 400, '缺少分析数据');
-      try {
-        return json(res, await ai.roast(d));
-      } catch (e) {
-        return err(res, 500, (e && e.message) ? e.message : 'AI 生成失败');
-      }
+    return aiRoute(req, res, (b) => {
+      if (!b.d || typeof b.d !== 'object') throw new Error('缺少分析数据');
+      return ai.roast(b.d);
     });
-    return;
   }
   // 情感基调 + 关系洞察
   if (req.method === 'POST' && p === '/api/ai/enrich') {
-    let body = '';
-    req.on('data', c => body += c);
-    req.on('end', async () => {
-      let b = {};
-      try { b = JSON.parse(body || '{}'); } catch (e) {}
-      const d = b.d;
-      if (!d || typeof d !== 'object') return err(res, 400, '缺少分析数据');
-      try {
-        return json(res, await ai.aiAnalyze(d));
-      } catch (e) {
-        return err(res, 500, (e && e.message) ? e.message : 'AI 生成失败');
-      }
+    return aiRoute(req, res, (b) => {
+      if (!b.d || typeof b.d !== 'object') throw new Error('缺少分析数据');
+      return ai.aiAnalyze(b.d);
     });
-    return;
+  }
+  // 狗头军师 · 相处建议（真 AI）：把服务端模板建议换成模型按真实统计现写的
+  if (req.method === 'POST' && p === '/api/ai/advice') {
+    return aiRoute(req, res, (b) => {
+      if (!b.d || typeof b.d !== 'object') throw new Error('缺少分析数据');
+      return ai.advice(b.d);
+    });
+  }
+  // 年度报告结尾寄语（真 AI）
+  if (req.method === 'POST' && p === '/api/ai/blessing') {
+    return aiRoute(req, res, (b) => {
+      if (!b.d || typeof b.d !== 'object') throw new Error('缺少分析数据');
+      return ai.blessing(b.d);
+    });
+  }
+  // To Do 清单锐评（真 AI）：清单是用户自己写的，本地模型跑，不外传
+  if (req.method === 'POST' && p === '/api/ai/todo') {
+    return aiRoute(req, res, (b) => {
+      const todos = Array.isArray(b.todos) ? b.todos : [];
+      if (!todos.length) throw bad(400, '还没有待办，先加两条再让它评');
+      if (todos.length > 60) throw bad(400, '待办太多了，先清理一下再让它评');
+      return ai.todoRoast({ todos });
+    });
+  }
+
+  // 热词榜 AI 归纳：把规则选出的候选词交给本地模型归类。
+  // 结果按「联系人 + 消息条数」缓存 —— 同一个数据不重复跑模型，省算力也省等待。
+  if (req.method === 'POST' && p === '/api/topwords/ai') {
+    return aiRoute(req, res, async (b) => {
+      const person = (readJson(path.join(DATA, 'persons.json')) || []).find(x => x.id === String(b.personId || ''));
+      if (!person) throw bad(404, '联系人不存在');
+
+      const msgs = ensureMessages(person) || [];
+      if (!msgs.length) throw bad(400, '还没有聊天记录');
+
+      const cachePath = path.join(DATA, 'ai_topics.json');
+      const cache = readJson(cachePath) || {};
+      const hit = cache[person.id];
+      if (hit && hit.n === msgs.length && b.force !== true) return hit.out;
+
+      const drop = nameStems([person.name, readSettings().myNick]);
+      // 双方各取前 20 个，合并去重后给模型；给太多它反而抓不住重点
+      const merged = new Map();
+      const seenW = new Set();
+      for (const w of [...topWords(msgs, true, 20, drop, seenW), ...topWords(msgs, false, 20, drop, seenW)]) {
+        merged.set(w.w, Math.max(merged.get(w.w) || 0, w.n));
+      }
+      const cands = [...merged.entries()].map(([w, n]) => ({ w, n })).sort((a, b2) => b2.n - a.n).slice(0, 40);
+      if (!cands.length) throw bad(400, '高频词太少，归纳不出话题');
+
+      const out = await ai.topics(person.name, cands);
+      if (out.topics && out.topics.length) {
+        cache[person.id] = { n: msgs.length, out };
+        fs.writeFileSync(cachePath, JSON.stringify(cache, null, 1), 'utf8');
+      }
+      return out;
+    }, (b) => {
+      const person = (readJson(path.join(DATA, 'persons.json')) || []).find(x => x.id === String(b.personId || ''));
+      if (!person) throw bad(404, '联系人不存在');
+      return person;   // 传给 handler 用，省得再查一遍
+    });
   }
 
   // ---------- 全自动抓取（剪贴板监听导入） ----------
@@ -1274,9 +1630,20 @@ const server = http.createServer((req, res) => {
   if (p === '/api/img-thumb') {
     const ts = url.searchParams.get('ts') || '';
     const file = thumbPath(ts);
-    if (!file) return err(res, 404, '该图片尚未被缓存（需在聊天软件里点开过才会生成缩略图）');
-    let buf;
-    try { buf = fs.readFileSync(file); } catch (e) { return err(res, 404, '缩略图读取失败'); }
+    let buf = null;
+    if (file) { try { buf = fs.readFileSync(file); } catch (e) { buf = null; } }
+    if (!buf) {
+      // 没缓存到就回一张 1×1 透明 GIF，不要回 404。
+      // 原因：<img> 收到 404 会让浏览器在控制台刷一条「Failed to load resource」红字，
+      // 而「这张图没缩略图」是完全正常的情况（只有点开过的图才会生成），不该当成错误报出来。
+      // 前端拿到空图会自己把节点摘掉，视觉上等同没有。
+      res.writeHead(200, {
+        'Content-Type': 'image/gif',
+        'Cache-Control': 'no-store',
+        'Content-Length': BLANK_GIF.length
+      });
+      return res.end(BLANK_GIF);
+    }
     res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Cache-Control': 'max-age=86400' });
     return res.end(buf);
   }
@@ -1379,6 +1746,72 @@ const server = http.createServer((req, res) => {
       return json(res, { ok: true, id });
     });
     return;
+  }
+
+  // 自定义头像：三选一 —— 上传图片 / 用 emoji或文字 / 恢复默认（昵称首字）
+  // 图片落盘到 data/avatars/<id>.<ext>，persons.json 只存文件名，避免把 base64 塞进 JSON 里越滚越大。
+  if (req.method === 'PUT' && /^\/api\/person\/[^/]+\/avatar$/.test(p)) {
+    const id = decodeURIComponent(p.split('/')[3]);
+    const personsPath = path.join(DATA, 'persons.json');
+    const persons = readJson(personsPath) || [];
+    const person = persons.find(x => x.id === id);
+    if (!person) return err(res, 404, '未找到该联系人');
+    let body = '';
+    let tooBig = false;
+    req.on('data', c => {
+      if (tooBig) return;                       // 已经超限就不再往内存里堆
+      body += c;
+      if (body.length > 9e6) { tooBig = true; body = ''; }
+    });
+    req.on('end', () => {
+      // 超限要好好回一个 413 再断开。直接 req.destroy() 会让客户端只看到连接被掐，
+      // 拿不到任何说明（测试里就是这么暴露出来的）。
+      if (tooBig) return err(res, 413, '图片太大了（限 4MB），先压一下再传');
+      let b = {};
+      try { b = JSON.parse(body || '{}'); } catch (e) {}
+      const old = person.avatarImg;
+      const save = (patch) => {
+        Object.assign(person, patch);
+        fs.writeFileSync(personsPath, JSON.stringify(persons, null, 1), 'utf8');
+        if (old && old !== person.avatarImg) { try { fs.unlinkSync(path.join(AVATAR_DIR, old)); } catch (e) {} }
+        return json(res, { ok: true, id, avatar: person.avatar, avatarImg: person.avatarImg || '', url: person.avatarImg ? '/api/avatar/' + id + '?v=' + Date.now() : '' });
+      };
+
+      if (b.reset) return save({ avatar: (person.name || '?')[0] || '?', avatarImg: '' });
+
+      if (b.img != null) {
+        // 只认这几种位图，扩展名由我们自己定，绝不采信客户端给的文件名
+        const m = /^data:image\/(png|jpeg|jpg|webp|gif);base64,([A-Za-z0-9+/=\s]+)$/.exec(String(b.img));
+        if (!m) return err(res, 400, '只支持 PNG / JPG / WebP / GIF 图片');
+        const ext = m[1] === 'jpg' ? 'jpeg' : m[1];
+        const buf = Buffer.from(m[2].replace(/\s/g, ''), 'base64');
+        if (!buf.length) return err(res, 400, '图片是空的');
+        if (buf.length > 4 * 1024 * 1024) return err(res, 413, '图片太大了（限 4MB），先压一下再传');
+        fs.mkdirSync(AVATAR_DIR, { recursive: true });
+        const file = id + '.' + ext;
+        const dest = path.join(AVATAR_DIR, file);
+        fs.writeFileSync(dest, buf);
+        return save({ avatarImg: file });
+      }
+
+      const text = String(b.text == null ? '' : b.text).trim().slice(0, 4);
+      if (!text) return err(res, 400, '内容不能为空');
+      return save({ avatar: text, avatarImg: '' });
+    });
+    return;
+  }
+
+  // 取联系人头像图。文件名从 persons.json 里读，不接受 URL 传参，避免路径穿越。
+  if (req.method === 'GET' && /^\/api\/avatar\/[^/]+$/.test(p)) {
+    const id = decodeURIComponent(p.split('/')[3]);
+    const person = (readJson(path.join(DATA, 'persons.json')) || []).find(x => x.id === id);
+    const file = person && person.avatarImg;
+    if (!file || !/^[A-Za-z0-9_.-]+$/.test(file)) return err(res, 404, '没有自定义头像');
+    const full = path.join(AVATAR_DIR, file);
+    if (!full.startsWith(AVATAR_DIR) || !fs.existsSync(full)) return err(res, 404, '头像文件不在了');
+    const type = { png: 'image/png', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif' }[file.split('.').pop()] || 'application/octet-stream';
+    res.writeHead(200, { 'Content-Type': type, 'Cache-Control': 'no-cache' });
+    return fs.createReadStream(full).pipe(res);
   }
 
   // 置顶/取消置顶联系人：持久化到 persons.json 的 pinned 字段
@@ -1499,9 +1932,22 @@ function json(res, obj) {
   res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(obj));
 }
+// 读请求体并解析成 JSON。全服务里「读 body」都是这五行，收一处省得每处各写一遍。
+function readBodyJson(req, cb) {
+  let body = '';
+  req.on('data', c => body += c);
+  req.on('end', () => {
+    let o = {};
+    try { o = JSON.parse(body || '{}'); } catch (e) {}
+    cb(o);
+  });
+}
+// 出错统一回 JSON。原来回的是纯文本，但前端一律按 r.json() 去读，
+// 于是下面 50 处调用给出的具体原因全被吞成一句通用的「操作失败」。
+// 改在这一处，所有调用方的报错内容一起恢复可读。
 function err(res, code, msg) {
-  res.writeHead(code, { 'Content-Type': 'text/plain; charset=utf-8' });
-  res.end(msg);
+  res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' });
+  res.end(JSON.stringify({ ok: false, error: String(msg == null ? '' : msg) }));
 }
 
 function lanIP() {
@@ -1513,6 +1959,21 @@ function lanIP() {
   }
   return '127.0.0.1';
 }
+
+// 端口被占用时不要抛未捕获异常把进程崩掉。
+// 正常双击启动走的是 Electron 单例锁，轮不到这里；但手动 `node server.js`
+// 再开应用、或上一次进程没退干净时，会撞上。给一句人话提示即可。
+server.on('error', (e) => {
+  if (e && e.code === 'EADDRINUSE') {
+    console.log('');
+    console.log('⚠ 端口 ' + PORT + ' 已被占用，服务没能启动。');
+    console.log('  通常是「相拥」已经开着，或者有另一个 node 进程在跑。');
+    console.log('  请先关掉已打开的窗口，或在任务管理器里结束 node.exe / electron.exe 后重试。');
+    console.log('');
+    return;
+  }
+  console.log('服务启动失败：' + ((e && e.message) || e));
+});
 
 server.listen(PORT, () => {
   console.log('相拥 · 关系分析室');
