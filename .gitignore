@@ -5,12 +5,25 @@ node_modules/
 data/
 temp/
 *.log
+*.out
+_*.json
+
+# 排查用的临时产物（GGUF 抽样、下载测试文件）
+_scratch/
+*.part
 
 # 截图与杂项
 screenshots/
+截图/
 .DS_Store
 Thumbs.db
 
 # 赛事提交材料（本地提交用，不进公开仓库）
 shithon提交信息.txt
 相拥-封面.png
+
+# 开发期测试脚本与截图（含上百 MB 二进制截图、本机绝对路径，不进公开仓库）
+测试脚本/
+
+# 个人化小工具（游戏避让清单，与本项目功能无关）
+工具/查游戏进程.js
